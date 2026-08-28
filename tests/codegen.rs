@@ -4,6 +4,8 @@
 //! cover the closure/application machinery that the AST and type-checker unit
 //! tests cannot reach.
 
+#![cfg(feature = "codegen")]
+
 use merlin_lang::ast;
 use merlin_lang::codegen;
 

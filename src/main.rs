@@ -30,7 +30,15 @@ fn main() {
     }
 
     match file {
-        None => merlin_lang::repl::repl_loop(None),
+        None => {
+            #[cfg(feature = "codegen")]
+            merlin_lang::repl::repl_loop(None);
+            #[cfg(not(feature = "codegen"))]
+            {
+                eprintln!("error: no input file and REPL is unavailable (built without codegen)");
+                process::exit(1);
+            }
+        }
         Some(path) => {
             let source = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
@@ -69,30 +77,41 @@ fn main() {
             }
             println!("typecheck: ok");
 
-            let context = merlin_lang::codegen::new_context();
-            match merlin_lang::codegen::lower(&prog, &context) {
-                Ok(mut module) => {
-                    println!(
-                        "codegen: ok ({} top-level functions)",
-                        module.function_count()
-                    );
+            #[cfg(feature = "codegen")]
+            {
+                let context = merlin_lang::codegen::new_context();
+                match merlin_lang::codegen::lower(&prog, &context) {
+                    Ok(mut module) => {
+                        println!(
+                            "codegen: ok ({} top-level functions)",
+                            module.function_count()
+                        );
 
-                    if dump_mlir {
-                        println!("{}", module.dump());
-                    }
+                        if dump_mlir {
+                            println!("{}", module.dump());
+                        }
 
-                    if !start_repl {
-                        compile_executable(&path, &mut module);
+                        if !start_repl {
+                            compile_executable(&path, &mut module);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("codegen: error: {}", e);
+                        process::exit(3);
                     }
-                },
-                Err(e) => {
-                    eprintln!("codegen: error: {}", e);
-                    process::exit(3);
+                }
+
+                if start_repl {
+                    merlin_lang::repl::repl_loop(Some(prog));
                 }
             }
 
-            if start_repl {
-                merlin_lang::repl::repl_loop(Some(prog));
+            #[cfg(not(feature = "codegen"))]
+            {
+                if dump_mlir || start_repl {
+                    eprintln!("error: `--mlir` and `--repl` require the `codegen` feature");
+                    process::exit(3);
+                }
             }
         }
     }
@@ -100,6 +119,7 @@ fn main() {
 
 /// Emit a native object file and link it into an executable named after the
 /// source file (with the `.mln` extension stripped).
+#[cfg(feature = "codegen")]
 fn compile_executable(source_path: &str, module: &mut merlin_lang::codegen::Module) {
     let output_path = std::path::Path::new(source_path).with_extension("");
     let obj_path = std::env::temp_dir().join(format!("merlin_{}.o", process::id()));

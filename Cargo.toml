@@ -3,12 +3,18 @@ name = "merlin-lang"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["codegen"]
+# MLIR -> LLVM backend + JIT pipeline. Disable with `--no-default-features`
+# when a system MLIR is unavailable; parsing and typechecking still work.
+codegen = ["dep:melior"]
+
 [dependencies]
 lalrpop-util = "0.23.1"
-# MLIR bindings for codegen (see src/codegen.rs); uncomment to enable the
-# MLIR -> LLVM backend + JIT pipeline. Requires a system LLVM with llvm-config
-# and the MLIR libraries.
-melior = "0.27.4"
+# MLIR bindings for codegen (see src/codegen.rs). Requires a system LLVM with
+# llvm-config and the MLIR libraries; compiled only when the `codegen` feature
+# is enabled.
+melior = { version = "0.27.4", optional = true }
 
 [build-dependencies]
 lalrpop = "0.23.1"

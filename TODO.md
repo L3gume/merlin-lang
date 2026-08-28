@@ -33,8 +33,10 @@
 - [ ] new types
     - [x] escape sequences in strings
     - [x] char
-    - [ ] User-defined structure types
+    - [x] User-defined structure types
     - [ ] n-tuple type
+- [ ] Pattern matching syntax
+    - [ ] change enum type pattern to `Name(arg1, ..., arg2)` instead of generic application
 - [x] get rid of REPL, more trouble than worth (or make it useable?)
     * simply ignore it for now I guess
 - [ ] optimizations
