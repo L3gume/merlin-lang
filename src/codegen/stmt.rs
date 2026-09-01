@@ -1123,6 +1123,53 @@ pub fn lower_decl<'a>(
 // Type declarations
 // ----------------------------------------------------------------------------
 
+/// Resolve record aliases inside a stored field type to their structural
+/// `Rec(RowExt(..))` form, mirroring the type checker's `expand`.
+///
+/// The type checker registers a `record` declaration as a *type alias* whose
+/// RHS is a `Rec` row, but a `TypeDecl`'s AST carries the raw field types,
+/// where a record name is still spelled `Enum(name)`. If such a type reaches
+/// `lower_type` unexpanded, its `Enum(_)` arm maps it to `!llvm.ptr` and the
+/// record payload is never materialized as a struct, so field access on it
+/// fails. Enum variant field types are the one raw type the codegen registry
+/// actually consumes (via `enum_variant_fields`), so they are expanded here.
+fn expand_stored_type(module: &Module, typ: &Monotype, seen: &mut Vec<String>) -> Monotype {
+    match typ {
+        Monotype::TypeVariable(_) => typ.clone(),
+        Monotype::TypeFuncApplication(func, args) => match &**func {
+            TypeFunc::Enum(name) if module.records.contains_key(name) => {
+                if seen.iter().any(|n| n == name) {
+                    return typ.clone();
+                }
+                seen.push(name.clone());
+                let rec = &module.records[name];
+                let mut map = HashMap::new();
+                for (p, a) in rec.params.iter().zip(args.iter()) {
+                    map.insert(p.clone(), a.clone());
+                }
+                let mut row = Monotype::empty_row();
+                for (label, field) in rec.fields.iter().rev() {
+                    let inst = field.instantiate(&mut map);
+                    row = Monotype::row_ext(
+                        label.clone(),
+                        expand_stored_type(module, &inst, seen),
+                        row,
+                    );
+                }
+                seen.pop();
+                Monotype::rec(row)
+            }
+            _ => {
+                let expanded: Vec<Monotype> = args
+                    .iter()
+                    .map(|a| expand_stored_type(module, a, seen))
+                    .collect();
+                Monotype::TypeFuncApplication(func.clone(), expanded)
+            }
+        },
+    }
+}
+
 /// Lower a type declaration by registering it in `module`.
 ///
 /// A `TypeDecl` emits no MLIR operations; it only records the type so that
@@ -1150,7 +1197,10 @@ pub fn lower_type_decl<'a>(
                     .map(|v| {
                         (
                             v.n.clone(),
-                            v.tparams.iter().map(|t| t.t.clone()).collect(),
+                            v.tparams
+                                .iter()
+                                .map(|t| expand_stored_type(module, &t.t, &mut Vec::new()))
+                                .collect(),
                         )
                     })
                     .collect(),

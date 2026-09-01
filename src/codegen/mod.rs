@@ -18,6 +18,7 @@
 mod apply;
 mod closures;
 mod enums;
+mod equality;
 mod execute;
 mod expr;
 mod lists;
@@ -147,6 +148,11 @@ pub struct Module<'a> {
     /// Cache of emitted specializations: `(binding name, canonical
     /// instantiation type, capture types) -> closure symbol`.
     specializations: HashMap<(String, String, String), String>,
+    /// Cache of emitted equality helpers: canonical (defaulted) type ->
+    /// function symbol.
+    eq_functions: HashMap<String, String>,
+    /// Number of equality helpers emitted, for unique symbol names.
+    eq_counter: usize,
     /// Function-valued `let` bindings whose right-hand side is an application
     /// (e.g. `let sum = lfold add 0;`), kept as expressions and inlined at
     /// use sites rather than evaluated to a closure value eagerly.
@@ -183,6 +189,8 @@ impl<'a> Module<'a> {
             closures: 0,
             abstractions: HashMap::new(),
             specializations: HashMap::new(),
+            eq_functions: HashMap::new(),
+            eq_counter: 0,
             inlineable: HashMap::new(),
             spec_counter: 0,
             let_counter: 0,

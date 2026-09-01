@@ -1,0 +1,21 @@
+enum Color = Black | Red;
+enum Direction = Left | Right;
+
+enum RbTree('a) = Leaf
+    | Node('a, Color, RbTree('a), RbTree('a));
+
+# Node -> Option Direction
+let direction = \node => match node
+    | Leaf => None
+    | Node parent l r c v => (
+        match parent
+        | Leaf => None
+        | Node pp pl pr pc pv => (
+            if node == pr then
+                Some Right
+            else
+                Some Left
+        )
+    );
+
+# TODO: several compiler bugs prevent implementing a red-black tree properly

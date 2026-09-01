@@ -902,12 +902,12 @@ fn infer_comparison(context : &mut TypeContext, op : &mut CompOp, e1 : &mut Box<
                 if let Monotype::TypeFuncApplication(f, _) = &unified && **f == TypeFunc::Fn {
                     return Err(UnificationError { pos: None, message: "Cannot compare function types".to_string() });
                 }
-                let op_name = if *op == CompOp::Eq { "==" } else { "!=" };
-                unify(context, &unified, &Monotype::int())
-                    .or_else(|_| unify(context, &unified, &Monotype::float()))
-                    .or_else(|_| unify(context, &unified, &Monotype::string()))
-                    .or_else(|_| unify(context, &unified, &Monotype::bool()))
-                    .map_err(|_| UnificationError { pos: None, message: format!("'{}' requires int, float, string, or bool operands", op_name) })?;
+                //let op_name = if *op == compop::eq { "==" } else { "!=" };
+                //unify(context, &unified, &Monotype::int())
+                //    .or_else(|_| unify(context, &unified, &Monotype::float()))
+                //    .or_else(|_| unify(context, &unified, &Monotype::string()))
+                //    .or_else(|_| unify(context, &unified, &Monotype::bool()))
+                //    .map_err(|_| UnificationError { pos: None, message: format!("'{}' requires int, float, string, or bool operands", op_name) })?;
             },
             _ => {
                 unify(context, &unified, &Monotype::int())

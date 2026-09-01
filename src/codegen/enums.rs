@@ -43,11 +43,16 @@ pub(crate) fn build_enum_value<'c, 'a>(
     Ok(value)
 }
 
-/// Build a heap struct of the given fields.
+/// Build a heap struct of the given fields, sized `size` bytes.
+///
+/// `size` is the total byte size of the payload struct (computed from the
+/// field types by [`super::types::monotype_size`]); a record-valued field is a
+/// struct value larger than the single pointer slot this used to assume.
 pub(crate) fn build_payload<'c, 'a>(
     module: &mut Module<'c>,
     block: &'a Block<'c>,
     fields: &[(Value<'c, 'a>, Type<'c>)],
+    size: i64,
     location: Location<'c>,
 ) -> Result<Value<'c, 'a>, String> {
     if fields.is_empty() {
@@ -57,7 +62,7 @@ pub(crate) fn build_payload<'c, 'a>(
     let payload_struct =
         Type::parse(module.context, &format!("!llvm.struct<({})>", names.join(", ")))
             .ok_or_else(|| "codegen: failed to create payload struct type".to_string())?;
-    let ptr = malloc_call(module, block, 8 * fields.len() as i64, location)?;
+    let ptr = malloc_call(module, block, size, location)?;
     for (i, (value, _)) in fields.iter().enumerate() {
         store_field(module, block, ptr, payload_struct, i as i32, *value, location)?;
     }
@@ -68,8 +73,11 @@ pub(crate) fn build_payload<'c, 'a>(
 pub(crate) enum PatternBind<'c> {
     /// `x::xs`: load the head/tail fields of a cons cell.
     Cons { head_name: String, head_type: Type<'c>, tail_name: String },
-    /// `Some x`: load the payload fields from the enum's `data` pointer.
-    Enum(Vec<(String, Type<'c>)>),
+    /// A constructor pattern: load the variable sub-patterns from the enum's
+    /// `data` pointer. `field_types` are the full payload field types in
+    /// declaration order (for the payload struct layout); `binds` maps each
+    /// bound variable to its payload field index (literals bind nothing).
+    Enum { field_types: Vec<Type<'c>>, binds: Vec<(String, usize)> },
     /// `Foo { bar: n, .. }`: extract the named fields of a record scrutinee.
     /// Each entry is `(bound var, field type, field index)`.
     Record { fields: Vec<(String, Type<'c>, usize)> },
@@ -93,20 +101,27 @@ pub(crate) fn destructure_pattern<'c, 'x>(
             let tail = load_field(module, block, scrut, cell, 1, ptr, location)?;
             Ok(vec![(head_name, head), (tail_name, tail)])
         }
-        Some(PatternBind::Enum(fields)) => {
+        Some(PatternBind::Enum { field_types, binds }) => {
             let enum_struct = enum_struct_type(module)?;
             let data = load_field(module, block, scrut, enum_struct, 1, ptr, location)?;
-            let names: Vec<String> = fields.iter().map(|(_, t)| t.to_string()).collect();
+            let names: Vec<String> = field_types.iter().map(|t| t.to_string()).collect();
             let payload_struct = Type::parse(
                 module.context,
                 &format!("!llvm.struct<({})>", names.join(", ")),
             )
             .ok_or_else(|| "codegen: failed to create payload struct type".to_string())?;
             let mut out = Vec::new();
-            for (i, (name, typ)) in fields.iter().enumerate() {
-                let v =
-                    load_field(module, block, data, payload_struct, i as i32, *typ, location)?;
-                out.push((name.clone(), v));
+            for (name, index) in binds {
+                let v = load_field(
+                    module,
+                    block,
+                    data,
+                    payload_struct,
+                    index as i32,
+                    field_types[index],
+                    location,
+                )?;
+                out.push((name, v));
             }
             Ok(out)
         }
@@ -146,6 +161,38 @@ pub(crate) fn enum_variant_fields<'a>(
         map.insert(p.clone(), a.clone());
     }
     Ok(fields.iter().map(|f| f.instantiate(&mut map)).collect())
+}
+
+/// Load field `index` of an enum variant payload. `fields` are the payload
+/// field MLIR types in declaration order; the payload struct type is derived
+/// from them exactly as [`destructure_pattern`] does.
+pub(crate) fn load_enum_payload_field<'c, 'x>(
+    module: &Module<'c>,
+    block: &'x Block<'c>,
+    scrut: Value<'c, 'x>,
+    fields: &[Type<'c>],
+    index: i32,
+    location: Location<'c>,
+) -> Result<Value<'c, 'x>, String> {
+    let ptr = Type::parse(module.context, "!llvm.ptr")
+        .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string())?;
+    let enum_struct = enum_struct_type(module)?;
+    let data = load_field(module, block, scrut, enum_struct, 1, ptr, location)?;
+    let names: Vec<String> = fields.iter().map(|t| t.to_string()).collect();
+    let payload_struct = Type::parse(
+        module.context,
+        &format!("!llvm.struct<({})>", names.join(", ")),
+    )
+    .ok_or_else(|| "codegen: failed to create payload struct type".to_string())?;
+    load_field(
+        module,
+        block,
+        data,
+        payload_struct,
+        index,
+        fields[index as usize],
+        location,
+    )
 }
 
 /// Compare `scrut`'s discriminant against `variant_index`, returning an i1.

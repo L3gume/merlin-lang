@@ -13,14 +13,14 @@ use melior::ir::{
 };
 
 use super::{Env, EnvEntry, Module};
-use super::closures::pattern_bound_vars;
 use super::apply::{
     bind_in_env, default_free_vars, lower_abstraction, lower_application, lower_let, lower_literal,
     lower_variable,
 };
 use super::enums::{
-    PatternBind, destructure_pattern, enum_disc_eq, enum_variant_fields,
+    PatternBind, destructure_pattern, enum_disc_eq, enum_variant_fields, load_enum_payload_field,
 };
+use super::equality::{is_aggregate, lower_equality};
 use super::lists::{list_elem, list_is_null, lower_cons, lower_list, integer_constant};
 use super::records::{extract_field, field_index, insert_field, record_fields, record_undef};
 use super::stmt::{ensure_extern, ptrtoint_i64, inttoptr_ptr};
@@ -311,6 +311,24 @@ fn lower_comparison<'c, 'a>(
 ) -> Result<Value<'c, 'a>, String> {
     let lhs = lower_expr(e1, block, module, env)?;
     let rhs = lower_expr(e2, block, module, env)?;
+
+    // `==`/`!=` support structural equality on aggregate types (records,
+    // enums, lists), which the primitive dispatch below cannot classify.
+    if matches!(op, CompOp::Eq | CompOp::NotEq) {
+        let typ = default_free_vars(&e1.typ);
+        if is_aggregate(&typ) {
+            let eq = lower_equality(&typ, lhs, rhs, block, module, location)?;
+            if matches!(op, CompOp::NotEq) {
+                let one = bool_constant(module, block, true, location)?;
+                return block
+                    .append_operation(arith_binop("arith.xori", eq, one, location)?)
+                    .result(0)
+                    .map_err(|e| e.to_string())
+                    .map(Into::into);
+            }
+            return Ok(eq);
+        }
+    }
 
     let operation = match primitive_kind(&e1.typ)? {
         Prim::Int | Prim::Bool => {
@@ -650,6 +668,25 @@ fn lower_match_cases<'c, 'a: 'b, 'b>(
         .map(Into::into)
 }
 
+/// Unwrap a constructor pattern `Ctor p1 ... pn` (parsed as left-nested
+/// applications) into the constructor name and its sub-patterns in application
+/// order (outermost argument last; `.rev()` recovers declaration order).
+fn constructor_pattern(pat: &Expr) -> Result<(String, Vec<Expr>), String> {
+    let mut sub_patterns = Vec::new();
+    let mut head = pat;
+    let ctor_name = loop {
+        match &*head.e {
+            ENode::Application(f, arg) => {
+                sub_patterns.push((**arg).clone());
+                head = f;
+            }
+            ENode::Variable(n) => break n.clone(),
+            _ => return Err(format!("codegen: unsupported match pattern {:?}", *pat.e)),
+        }
+    };
+    Ok((ctor_name, sub_patterns))
+}
+
 /// The bindings a non-catch-all case pattern produces (loaded in the branch
 /// body) and, for constructor patterns, the discriminant it must equal.
 pub(crate) fn case_pattern<'c>(
@@ -681,39 +718,45 @@ pub(crate) fn case_pattern<'c>(
                 None,
             ))
         }
-        // `Some x` binds the constructor's payload field.
-        ENode::Application(ctor, arg) => {
-            let ctor_name = match &*ctor.e {
-                ENode::Variable(n) => n.clone(),
-                _ => {
-                    return Err(format!(
-                        "codegen: unsupported match pattern {:?}",
-                        *case.val.e
-                    ))
-                }
-            };
+        // `Some x` (or a curried `Pair x y`) binds the constructor's payload
+        // fields that are variables and tests those that are literals.
+        ENode::Application(_, _) => {
+            let (ctor_name, sub_patterns) = constructor_pattern(&case.val)?;
             let &(ref enum_name, variant_index, arity) = module
                 .constructors
                 .get(&ctor_name)
                 .ok_or_else(|| {
                     format!("codegen: unsupported match pattern {:?}", *case.val.e)
                 })?;
-            if arity != 1 {
+            if sub_patterns.len() != arity {
                 return Err(format!(
-                    "codegen: constructor pattern `{ctor_name}` with arity {arity} is not supported"
+                    "codegen: constructor pattern `{ctor_name}` with arity {arity} applied to {} arguments",
+                    sub_patterns.len()
                 ));
             }
-            let bound = pattern_bound_vars(arg);
-            if bound.len() != 1 {
-                return Err(
-                    "codegen: only single-variable constructor patterns are supported"
-                        .to_string(),
-                );
-            }
             let fields = enum_variant_fields(module, scrut_typ, enum_name, variant_index)?;
-            let field_type = lower_type(&default_free_vars(&fields[0]), module)?;
+            let field_mlirs: Vec<Type<'c>> = fields
+                .iter()
+                .map(|m| lower_type(&default_free_vars(m), module))
+                .collect::<Result<_, _>>()?;
+            let mut binds = Vec::with_capacity(arity);
+            for (i, pat) in sub_patterns.iter().rev().enumerate() {
+                match &*pat.e {
+                    ENode::Variable(n) => binds.push((n.clone(), i)),
+                    ENode::Literal(_) => {}
+                    _ => {
+                        return Err(
+                            "codegen: only variable or literal constructor patterns are supported"
+                                .to_string(),
+                        )
+                    }
+                }
+            }
             Ok((
-                Some(PatternBind::Enum(vec![(bound[0].clone(), field_type)])),
+                Some(PatternBind::Enum {
+                    field_types: field_mlirs,
+                    binds,
+                }),
                 Some(variant_index),
             ))
         }
@@ -833,12 +876,54 @@ pub(crate) fn case_condition<'c, 'a>(
             }
             Ok(cond)
         }
-        // `Some x` / `None` match on the discriminant.
+        // `Some x` / `Some 5` / `Pair a b` / `None`: match on the discriminant
+        // and, for payload constructors, on any literal field sub-patterns.
         _ => {
             let index = ctor_index.ok_or_else(|| {
                 "codegen: internal error: missing constructor index".to_string()
             })?;
-            enum_disc_eq(module, block, scrut, index, location)
+            let mut cond = enum_disc_eq(module, block, scrut, index, location)?;
+            if let ENode::Application(_, _) = &*case.val.e {
+                let (ctor_name, sub_patterns) = constructor_pattern(&case.val)?;
+                let &(ref enum_name, variant_index, _) = module
+                    .constructors
+                    .get(&ctor_name)
+                    .ok_or_else(|| {
+                        format!("codegen: unsupported match pattern {:?}", *case.val.e)
+                    })?;
+                let fields = enum_variant_fields(module, scrut_typ, enum_name, variant_index)?;
+                let field_mlirs: Vec<Type<'c>> = fields
+                    .iter()
+                    .map(|m| lower_type(&default_free_vars(m), module))
+                    .collect::<Result<_, _>>()?;
+                for (i, pat) in sub_patterns.iter().rev().enumerate() {
+                    if let ENode::Literal(lit) = &*pat.e {
+                        let field_val = load_enum_payload_field(
+                            module, block, scrut, &field_mlirs, i as i32, location,
+                        )?;
+                        let lit_val = lower_literal(lit, block, module, location)?;
+                        let cmp = arith::cmpi(
+                            module.context,
+                            arith::CmpiPredicate::Eq,
+                            field_val,
+                            lit_val,
+                            location,
+                        );
+                        let cmp_val: Value<'c, 'a> = block
+                            .append_operation(cmp)
+                            .result(0)
+                            .map_err(|e| e.to_string())?
+                            .into();
+                        let and = arith_binop("arith.andi", cond, cmp_val, location)?;
+                        cond = block
+                            .append_operation(and)
+                            .result(0)
+                            .map_err(|e| e.to_string())?
+                            .into();
+                    }
+                }
+            }
+            Ok(cond)
         }
     }
 }

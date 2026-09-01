@@ -132,7 +132,22 @@ pub(crate) fn pattern_bound_vars(pat: &Expr) -> Vec<String> {
             }
             v
         }
-        ENode::Application(_, arg) => pattern_bound_vars(arg),
+        ENode::Application(_, _) => {
+            // A constructor pattern `Ctor p1 ... pn` is parsed as left-nested
+            // applications; the head is the constructor name (never a
+            // binding), while each argument is a sub-pattern.
+            let mut pats = Vec::new();
+            let mut head = pat;
+            while let ENode::Application(f, arg) = &*head.e {
+                pats.push(arg);
+                head = f;
+            }
+            let mut v = Vec::new();
+            for p in pats {
+                v.extend(pattern_bound_vars(p));
+            }
+            v
+        }
         ENode::Record(_, fields) => {
             let mut v = Vec::new();
             for fa in fields {

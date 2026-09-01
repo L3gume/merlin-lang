@@ -24,7 +24,7 @@ use super::enums::{build_enum_value, build_payload};
 use super::expr::lower_expr;
 use super::lists::empty_list;
 use super::tail::{TailCtx, lower_tail};
-use super::types::lower_type;
+use super::types::{lower_type, tuple_size};
 
 pub(crate) fn lower_let<'c, 'a>(
     name: &str,
@@ -229,6 +229,14 @@ pub(crate) fn lower_variable<'c, 'a>(
         return build_enum_value(module, block, variant_index, payload, location);
     }
 
+    // A payload constructor used as a bare value (`Some` without its argument)
+    // would be a partial application, which is not supported.
+    if let Some(&(_, _, arity)) = module.constructors.get(name) && arity > 0 {
+        return Err(format!(
+            "codegen: partial application of constructor `{name}` is not supported"
+        ));
+    }
+
     let function_type = module.symbols.get(name).ok_or_else(|| {
         if TypeContext::is_builtin(name) {
             format!("codegen: builtin `{name}` is not implemented yet")
@@ -423,25 +431,34 @@ pub(crate) fn lower_application<'c, 'a>(
     location: Location<'c>,
 ) -> Result<Value<'c, 'a>, String> {
 
-    // A single-argument constructor application `Some x`.
-    if let ENode::Variable(name) = &*f.e 
-    && let Some(&(_, variant_index, arity)) = module.constructors.get(name) {
-        if arity != 1 {
-            return Err(format!(
-                "codegen: constructor `{name}` applied to the wrong number of arguments"
-            ));
-        }
-        let value = lower_expr(x, block, module, env)?;
-        let typ = lower_type(&default_free_vars(&x.typ), module)?;
-        let payload = build_payload(module, block, &[(value, typ)], location)?;
-        return build_enum_value(module, block, variant_index, payload, location);
-    }
-
     // Flatten `(((f a) b) c)` into a root and an ordered argument list,
     // expanding any inlineable function-valued `let` bindings.
     let mut args = Vec::new();
     let root = collect_application_root(f, &mut args, module);
     args.push((*x).clone());
+
+    // An enum constructor applied to all of its arguments: allocate the enum
+    // value with a payload struct holding every field.
+    if let ENode::Variable(name) = &*root.e
+    && let Some(&(_, variant_index, arity)) = module.constructors.get(name) {
+        if args.len() != arity {
+            return Err(format!(
+                "codegen: constructor `{name}` applied to the wrong number of arguments"
+            ));
+        }
+        let mut fields = Vec::with_capacity(arity);
+        let mut field_monos = Vec::with_capacity(arity);
+        for arg in &args {
+            let value = lower_expr(arg, block, module, env)?;
+            let mono = default_free_vars(&arg.typ);
+            let typ = lower_type(&mono, module)?;
+            field_monos.push(mono);
+            fields.push((value, typ));
+        }
+        let size = tuple_size(&field_monos) as i64;
+        let payload = build_payload(module, block, &fields, size, location)?;
+        return build_enum_value(module, block, variant_index, payload, location);
+    }
 
     // A known lambda applied to exactly as many arguments as it takes: emit a
     // multi-argument specialization and call it once. The local environment

@@ -44,6 +44,13 @@ fn expect_list(source: &str) -> Vec<codegen::ExecutionResult> {
     }
 }
 
+fn expect_bool(source: &str) -> bool {
+    match run(source, false) {
+        Ok(codegen::ExecutionResult::Bool(b)) => b,
+        other => panic!("expected Bool, got {other:?}"),
+    }
+}
+
 fn expect_bool_prelude(source: &str) -> bool {
     match run(source, true) {
         Ok(codegen::ExecutionResult::Bool(b)) => b,
@@ -513,5 +520,145 @@ fn non_tail_recursion_still_works() {
     assert_eq!(
         expect_int("let depth = \\(n : int) => if n == 0 then 0 else depth (n - 1) + 1; depth 1000;"),
         1000
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Structural equality (== / !=) on lists, enums, and records
+// ----------------------------------------------------------------------------
+
+#[test]
+fn list_equality() {
+    assert!(expect_bool("[1,2,3] == [1,2,3];"));
+    assert!(!expect_bool("[1,2] == [1,2,3];"));
+    assert!(!expect_bool("[1,2,3] != [1,2,3];"));
+    assert!(expect_bool("[1,2] != [1,2,3];"));
+    assert!(expect_bool("[] == [];"));
+    assert!(!expect_bool("[1,2] == [1,3];"));
+}
+
+#[test]
+fn nested_list_equality() {
+    assert!(expect_bool("[[1],[2,3]] == [[1],[2,3]];"));
+    assert!(!expect_bool("[[1],[2,3]] == [[1],[2]];"));
+    assert!(expect_bool("[[],[1]] != [[]];"));
+}
+
+#[test]
+fn enum_equality() {
+    assert!(expect_bool_prelude("Some 5 == Some 5;"));
+    assert!(!expect_bool_prelude("Some 5 == None;"));
+    assert!(expect_bool_prelude("Some 5 != None;"));
+    assert!(expect_bool_prelude("None == None;"));
+    assert!(expect_bool_prelude("Some 5 != Some 6;"));
+}
+
+#[test]
+fn record_equality() {
+    assert!(expect_bool(
+        "record Point = { x: int, y: int };
+         let p1 = Point { x: 1, y: 2 };
+         let p2 = Point { x: 1, y: 2 };
+         p1 == p2;"
+    ));
+    assert!(!expect_bool(
+        "record Point = { x: int, y: int };
+         let p1 = Point { x: 1, y: 2 };
+         let p2 = Point { x: 3, y: 2 };
+         p1 == p2;"
+    ));
+}
+
+#[test]
+fn record_equality_with_string_field() {
+    assert!(expect_bool(
+        "record P = { x: int, s: str };
+         let p1 = P { x: 1, s: \"a\" };
+         let p2 = P { x: 1, s: \"a\" };
+         p1 == p2;"
+    ));
+    assert!(!expect_bool(
+        "record P = { x: int, s: str };
+         let p1 = P { x: 1, s: \"a\" };
+         let p2 = P { x: 1, s: \"b\" };
+         p1 == p2;"
+    ));
+}
+
+#[test]
+fn record_equality_with_nested_option() {
+    assert!(expect_bool_prelude(
+        "record P = { x: int, o: Option str };
+         let p1 = P { x: 1, o: Some \"hi\" };
+         let p2 = P { x: 1, o: Some \"hi\" };
+         p1 == p2;"
+    ));
+    assert!(!expect_bool_prelude(
+        "record P = { x: int, o: Option str };
+         let p1 = P { x: 1, o: Some \"hi\" };
+         let p2 = P { x: 1, o: None };
+         p1 == p2;"
+    ));
+}
+
+#[test]
+fn recursive_enum_equality() {
+    // A self-referential enum must not infinitely recurse during codegen; the
+    // equality helper is cached before its body is lowered.
+    assert!(expect_bool(
+        "enum Nat = Zero | Succ(Nat);
+         let two = Succ (Succ Zero);
+         two == Succ (Succ Zero);"
+    ));
+    assert!(!expect_bool(
+        "enum Nat = Zero | Succ(Nat);
+         let two = Succ (Succ Zero);
+         two == Succ Zero;"
+    ));
+}
+
+#[test]
+fn list_of_options_equality() {
+    assert!(expect_bool_prelude("[Some 1, None] == [Some 1, None];"));
+    assert!(!expect_bool_prelude("[Some 1, None] == [Some 1, Some 2];"));
+}
+
+// ----------------------------------------------------------------------------
+// n-ary enum constructors and patterns
+// ----------------------------------------------------------------------------
+
+#[test]
+fn n_ary_enum_construct_and_match() {
+    assert_eq!(
+        expect_int(
+            "enum Trio = T(int, int, int);
+             let sum = \\t => match t | T a b c => a + b + c | _ => 0;
+             sum (T 1 2 3);"
+        ),
+        6
+    );
+}
+
+#[test]
+fn n_ary_enum_pattern_with_literal_field() {
+    assert_eq!(
+        expect_int(
+            "enum Trio = T(int, int, int);
+             let mid = \\t => match t | T a 2 c => a + c | _ => 0;
+             mid (T 1 2 3);"
+        ),
+        4
+    );
+}
+
+#[test]
+fn n_ary_enum_pattern_all_literals() {
+    assert_eq!(
+        expect_int(
+            "enum Trio = T(int, int, int);
+             let is_it = \\t => match t | T 1 2 3 => 42 | _ => 0;
+             is_it (T 1 2 3);"
+        ),
+        42
     );
 }

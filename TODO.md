@@ -41,7 +41,7 @@
     * simply ignore it for now I guess
 - [ ] optimizations
     - [x] tail call optimization (self tail calls lower to loop backedges; mutual/indirect tail calls still grow the stack)
-    - [ ] logic expr short-circuiting
+    - [x] logic expr short-circuiting
 - [ ] lifetime analysis for memory mgmt with refs like in Rust
 - [ ] str-related builtins
     - [ ] support cons expression? (char::\[char\])
@@ -54,3 +54,4 @@
     - [ ] trim, rtrim, ltrim
     - [ ] whatever else, leverage libc I guess
 - [ ] unicode character support
+- [ ] n-ary enum constructor support (only 1 for now..)

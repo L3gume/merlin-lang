@@ -95,3 +95,66 @@ pub(crate) fn lower_type<'a>(typ: &Monotype, module: &Module<'a>) -> Result<Type
         }
     }
 }
+
+// ----------------------------------------------------------------------------
+// Size computation (for sizing heap allocations of lowered values)
+// ----------------------------------------------------------------------------
+
+/// Byte size of a [`Monotype`] under LLVM's default data layout.
+///
+/// Used to size the heap allocation that backs an enum payload: a payload
+/// field that is a record is a struct value, which can be larger than the
+/// `8` bytes `build_payload` used to assume per field.
+pub(crate) fn monotype_size(typ: &Monotype) -> usize {
+    match typ {
+        Monotype::TypeVariable(_) => 8,
+        Monotype::TypeFuncApplication(f, _) => match &**f {
+            TypeFunc::Bool => 1,
+            TypeFunc::Int | TypeFunc::Float | TypeFunc::Char | TypeFunc::Unit => 4,
+            TypeFunc::Str | TypeFunc::List | TypeFunc::Enum(_) | TypeFunc::Fn => 8,
+            TypeFunc::Rec => struct_size(&record_fields(typ).unwrap_or_default()),
+            TypeFunc::RowExt(_) | TypeFunc::EmptyRow | TypeFunc::Infer => 8,
+        },
+    }
+}
+
+/// Alignment of a [`Monotype`] under LLVM's default data layout.
+fn monotype_align(typ: &Monotype) -> usize {
+    match typ {
+        Monotype::TypeVariable(_) => 8,
+        Monotype::TypeFuncApplication(f, _) => match &**f {
+            TypeFunc::Bool => 1,
+            TypeFunc::Int | TypeFunc::Float | TypeFunc::Char | TypeFunc::Unit => 4,
+            TypeFunc::Rec => record_fields(typ)
+                .unwrap_or_default()
+                .iter()
+                .map(|(_, t)| monotype_align(t))
+                .max()
+                .unwrap_or(1),
+            _ => 8,
+        },
+    }
+}
+
+/// Size of a record struct laid out in field order (LLVM default layout:
+/// each field aligned to its natural alignment, the struct rounded up to its
+/// largest member's alignment).
+fn struct_size(fields: &[(String, Monotype)]) -> usize {
+    tuple_size(&fields.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>())
+}
+
+/// Byte size of a struct laid out from `types` in declaration order (LLVM
+/// default layout: each field aligned to its natural alignment, the struct
+/// rounded up to its largest member's alignment). Used to size an enum
+/// variant payload holding multiple fields.
+pub(crate) fn tuple_size(types: &[Monotype]) -> usize {
+    let mut offset = 0usize;
+    let mut max_align = 1usize;
+    for t in types {
+        let align = monotype_align(t);
+        offset = offset.div_ceil(align) * align;
+        offset += monotype_size(t);
+        max_align = max_align.max(align);
+    }
+    offset.div_ceil(max_align) * max_align
+}
