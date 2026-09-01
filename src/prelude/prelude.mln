@@ -155,9 +155,12 @@ let tfilter = \pred ls =>
 # append (tail recursive)
 let append = \ls1 ls2 =>
     let aux = (\acc l => match l
-    | [] => acc
-    | x::xs => aux (x::acc) xs)
+        | [] => acc
+        | x::xs => aux (x::acc) xs)
     in
     aux ls2 (rev ls1);
 
-# TODO: zip, needs n-tuple support for elegant impl
+let zip = \ls1 ls2 => match (ls1, ls2)
+    | (a::as, b::bs) => ((a, b))::(zip as bs)
+    | _ => [];
+

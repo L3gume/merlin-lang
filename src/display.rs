@@ -52,6 +52,7 @@ fn render_type_inner(t: &Monotype, vars: &mut HashMap<String, String>) -> String
             TypeFunc::Rec => todo!(),
             TypeFunc::RowExt(_) => todo!(),
             TypeFunc::EmptyRow => todo!(),
+            TypeFunc::Tuple => todo!(),
         },
     }
 }

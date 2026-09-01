@@ -60,7 +60,7 @@ pub(crate) fn is_aggregate(typ: &Monotype) -> bool {
     matches!(
         typ,
         Monotype::TypeFuncApplication(f, _)
-            if matches!(**f, TypeFunc::List | TypeFunc::Enum(_) | TypeFunc::Rec)
+            if matches!(**f, TypeFunc::List | TypeFunc::Enum(_) | TypeFunc::Rec | TypeFunc::Tuple)
     )
 }
 
@@ -130,8 +130,31 @@ fn eq_body<'c, 'a>(
         Monotype::TypeFuncApplication(f, _) if matches!(**f, TypeFunc::Rec) => {
             lower_record_eq(typ, lhs, rhs, block, module, location)
         }
+        Monotype::TypeFuncApplication(f, args) if matches!(**f, TypeFunc::Tuple) => {
+            lower_tuple_eq(lhs, rhs, block, module, location, args)
+        }
         _ => lower_scalar_eq(typ, lhs, rhs, block, module, location),
     }
+}
+
+fn lower_tuple_eq<'c, 'a>(
+    lhs: Value<'c, 'a>,
+    rhs: Value<'c, 'a>,
+    block: &'a Block<'c>,
+    module: &mut Module<'c>,
+    location: Location<'c>,
+    args: &[Monotype]
+) -> Result<Value<'c, 'a>, String> {
+    let mut acc = bool_constant(module, block, true, location)?;
+    for (i, field_ty) in args.iter().enumerate() {
+        let concrete = default_free_vars(field_ty);
+        let field_mlir = lower_type(&concrete, module)?;
+        let l = extract_field(module, block, lhs, i as i32, field_mlir, location)?;
+        let r = extract_field(module, block, rhs, i as i32, field_mlir, location)?;
+        let eq = lower_equality(&concrete, l, r, block, module, location)?;
+        acc = and_values(block, acc, eq, location)?;
+    }
+    Ok(acc)
 }
 
 /// Inline scalar equality: `arith.cmpi` for int/bool, `arith.cmpf` for float,

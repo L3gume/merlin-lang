@@ -309,6 +309,7 @@ pub enum ENode {
     FieldAccess(Box<Expr>, String),
     Record(Option<String>, Vec<FieldAssn>),
     With(Box<Expr>, Vec<FieldAssn>),
+    Tuple(Vec<Expr>),
 }
 
 impl Display for ENode {
@@ -334,6 +335,7 @@ impl Display for ENode {
                 field_assns.iter().map(|fa| format!("{}: {}", fa.field, fa.exp)).collect::<Vec<_>>().join(", ")),
             ENode::With(expr, field_assns) => write!(f, "With({}, {})", expr,
                 field_assns.iter().map(|fa| format!("{}: {}", fa.field, fa.exp)).collect::<Vec<_>>().join(", ")),
+            ENode::Tuple(exprs) => write!(f, "({})", exprs.iter().map(|e| e.to_string()).collect::<Vec<_>>().join(", ")),
         }
     }
 }
@@ -477,6 +479,11 @@ fn fill_expr_positions(expr : &mut Expr, index : &LineIndex) {
             fill_expr_positions(e, index);
             for fa in fields.iter_mut() {
                 fill_expr_positions(&mut fa.exp, index);
+            }
+        },
+        ENode::Tuple(exprs) => {
+            for e in exprs.iter_mut() {
+                fill_expr_positions(e, index);
             }
         },
     }

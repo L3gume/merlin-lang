@@ -31,9 +31,18 @@ pub(crate) fn lower_type<'a>(typ: &Monotype, module: &Module<'a>) -> Result<Type
             TypeFunc::List => Err("codegen: list type lowering not implemented".to_string()),
             TypeFunc::Enum(_) => Type::parse(module.context, "!llvm.ptr")
                 .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string()),
-            TypeFunc::Rec | TypeFunc::RowExt(_) | TypeFunc::EmptyRow => {
-                Err("codegen: cannot lower a bare row constructor".to_string())
+            TypeFunc::Rec | TypeFunc::RowExt(_) | TypeFunc::EmptyRow => Err("codegen: cannot lower a bare row constructor".to_string()),
+            TypeFunc::Tuple => Err("codegen: tupes with empty args cannot be lowered".to_string()),
+        },
+        // A tuple type lowers to an anonymous struct of its element types in order.
+        Monotype::TypeFuncApplication(f, args) if matches!(**f, TypeFunc::Tuple) => {
+            let mut field_types: Vec<String> = Vec::new();
+            for arg in args {
+                field_types.push(lower_type(&default_free_vars(arg), module)?.to_string());
             }
+            let struct_str = format!("!llvm.struct<({})>", field_types.join(", "));
+            Type::parse(module.context, &struct_str)
+                .ok_or_else(|| format!("codegen: failed to create tuple struct type `{struct_str}`"))
         },
         // A record type lowers to a struct of its fields in row order
         // (canonicalized to declaration order by the type checker).
@@ -77,12 +86,12 @@ pub(crate) fn lower_type<'a>(typ: &Monotype, module: &Module<'a>) -> Result<Type
             }
         }
         Monotype::TypeFuncApplication(f, args)
-            if matches!(**f, TypeFunc::List) && args.len() == 1 =>
-        {
+            if matches!(**f, TypeFunc::List) && args.len() == 1 => {
             Type::parse(module.context, "!llvm.ptr")
                 .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string())
         }
-        Monotype::TypeFuncApplication(f, _) if matches!(**f, TypeFunc::Enum(_)) => {
+        Monotype::TypeFuncApplication(f, _)
+            if matches!(**f, TypeFunc::Enum(_)) => {
             Type::parse(module.context, "!llvm.ptr")
                 .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string())
         }
@@ -108,12 +117,13 @@ pub(crate) fn lower_type<'a>(typ: &Monotype, module: &Module<'a>) -> Result<Type
 pub(crate) fn monotype_size(typ: &Monotype) -> usize {
     match typ {
         Monotype::TypeVariable(_) => 8,
-        Monotype::TypeFuncApplication(f, _) => match &**f {
+        Monotype::TypeFuncApplication(f, types) => match &**f {
             TypeFunc::Bool => 1,
             TypeFunc::Int | TypeFunc::Float | TypeFunc::Char | TypeFunc::Unit => 4,
             TypeFunc::Str | TypeFunc::List | TypeFunc::Enum(_) | TypeFunc::Fn => 8,
             TypeFunc::Rec => struct_size(&record_fields(typ).unwrap_or_default()),
             TypeFunc::RowExt(_) | TypeFunc::EmptyRow | TypeFunc::Infer => 8,
+            TypeFunc::Tuple => tuple_size(types),
         },
     }
 }

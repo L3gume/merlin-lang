@@ -21,6 +21,7 @@ pub enum TypeFunc {
     Rec,
     RowExt(String),
     EmptyRow,
+    Tuple,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,6 +60,7 @@ impl Display for Monotype {
                     },
                     TypeFunc::RowExt(n) => write!(f, "({}: {}; {})", n, monotypes[0], monotypes[1]),
                     TypeFunc::EmptyRow => write!(f, "∅"),
+                    TypeFunc::Tuple => write!(f, "({})", monotypes.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", ")),
                 }
             }
         }
@@ -191,6 +193,10 @@ impl Monotype {
 
     pub fn empty_row() -> Monotype {
         Monotype::TypeFuncApplication(Box::new(TypeFunc::EmptyRow), vec![])
+    }
+    
+    pub fn tuple(exprs : Vec<Monotype>) -> Monotype {
+        Monotype::TypeFuncApplication(Box::new(TypeFunc::Tuple), exprs)
     }
 
 }
@@ -694,6 +700,7 @@ fn algo_w_inner(context : &mut TypeContext, expr : &mut Expr) -> Result<(Substit
         ENode::FieldAccess(e, f) => infer_field_access(context, e, f),
         ENode::Record(name, fs) => infer_record(context, name, fs),
         ENode::With(e, fs) => infer_with(context, e, fs),
+        ENode::Tuple(exprs) => infer_tuple(context, exprs),
     }
 }
 
@@ -902,12 +909,6 @@ fn infer_comparison(context : &mut TypeContext, op : &mut CompOp, e1 : &mut Box<
                 if let Monotype::TypeFuncApplication(f, _) = &unified && **f == TypeFunc::Fn {
                     return Err(UnificationError { pos: None, message: "Cannot compare function types".to_string() });
                 }
-                //let op_name = if *op == compop::eq { "==" } else { "!=" };
-                //unify(context, &unified, &Monotype::int())
-                //    .or_else(|_| unify(context, &unified, &Monotype::float()))
-                //    .or_else(|_| unify(context, &unified, &Monotype::string()))
-                //    .or_else(|_| unify(context, &unified, &Monotype::bool()))
-                //    .map_err(|_| UnificationError { pos: None, message: format!("'{}' requires int, float, string, or bool operands", op_name) })?;
             },
             _ => {
                 unify(context, &unified, &Monotype::int())
@@ -1093,6 +1094,18 @@ fn infer_with(context : &mut TypeContext, expr : &mut Box<Expr>, field_assns : &
     Ok((combined.clone(), t1.apply(&combined)))
 }
 
+fn infer_tuple(context : &mut TypeContext, exprs : &mut Vec<Expr>) -> Result<(Substitution, Monotype), UnificationError> {
+    let mut combined = Substitution::new();
+    let mut types = Vec::with_capacity(exprs.len());
+    for e in exprs.iter_mut() {
+        let (s_i, t_i) = algo_w(context, e)?;
+        *context = context.apply(&s_i);
+        combined = combined.combine(s_i);
+        types.push(t_i.apply(&combined));
+    }
+    Ok((combined, Monotype::tuple(types)))
+}
+
 pub fn type_pattern(context : &mut TypeContext, expr : &Expr, typ : &Monotype) -> Result<Substitution,UnificationError> {
     match &*expr.e {
         ENode::Literal(lit) => {
@@ -1185,6 +1198,18 @@ pub fn type_pattern(context : &mut TypeContext, expr : &Expr, typ : &Monotype) -
             }
             Ok(combined)
         },
+        ENode::Tuple(exprs) => {
+            let alphas : Vec<Monotype> = exprs.iter().map(|_| Monotype::var(context.new_typevar())).collect();
+            let s0 = unify(context, typ, &Monotype::tuple(alphas.clone()))?;
+            *context = context.apply(&s0);
+            let mut combined = s0;
+            for (e, alpha) in exprs.iter().zip(alphas.iter()) {
+                let s = type_pattern(context, e, &alpha.apply(&combined))?;
+                *context = context.apply(&s);
+                combined = combined.combine(s);
+            }
+            Ok(combined)
+        }
         _ => Err(UnificationError { pos: None, message: format!("Unsupported pattern {:?}", expr) }),
     }
 }
@@ -1339,6 +1364,11 @@ fn resolve_expr_types(expr : &mut Expr, sub : &Substitution) {
             resolve_expr_types(e, sub);
             for fa in fields.iter_mut() {
                 resolve_expr_types(&mut fa.exp, sub);
+            }
+        },
+        ENode::Tuple(exprs) => {
+            for e in exprs.iter_mut() {
+                resolve_expr_types(e, sub);
             }
         },
     }

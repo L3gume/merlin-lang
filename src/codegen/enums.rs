@@ -71,6 +71,8 @@ pub(crate) fn build_payload<'c, 'a>(
 
 /// Bindings produced by destructuring a match pattern.
 pub(crate) enum PatternBind<'c> {
+    /// A bare variable sub-pattern bound directly to the scrutinee value.
+    Var { name: String },
     /// `x::xs`: load the head/tail fields of a cons cell.
     Cons { head_name: String, head_type: Type<'c>, tail_name: String },
     /// A constructor pattern: load the variable sub-patterns from the enum's
@@ -81,6 +83,10 @@ pub(crate) enum PatternBind<'c> {
     /// `Foo { bar: n, .. }`: extract the named fields of a record scrutinee.
     /// Each entry is `(bound var, field type, field index)`.
     Record { fields: Vec<(String, Type<'c>, usize)> },
+    /// `(p1, ..., pn)`: destructure a tuple scrutinee, recursing into each
+    /// element's sub-pattern. Each entry is `(element type, sub-binding)`;
+    /// a `None` sub-binding means the element pattern binds nothing.
+    Tuple { elements: Vec<(Type<'c>, Option<PatternBind<'c>>)> },
 }
 
 /// Load the bindings of a match pattern inside `block`.
@@ -95,6 +101,7 @@ pub(crate) fn destructure_pattern<'c, 'x>(
         .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string())?;
     match binding {
         None => Ok(vec![]),
+        Some(PatternBind::Var { name }) => Ok(vec![(name, scrut)]),
         Some(PatternBind::Cons { head_name, head_type, tail_name }) => {
             let cell = cell_struct_type(module, head_type)?;
             let head = load_field(module, block, scrut, cell, 0, head_type, location)?;
@@ -130,6 +137,20 @@ pub(crate) fn destructure_pattern<'c, 'x>(
             for (name, ty, index) in fields {
                 let v = extract_field(module, block, scrut, index as i32, ty, location)?;
                 out.push((name, v));
+            }
+            Ok(out)
+        }
+        Some(PatternBind::Tuple { elements }) => {
+            let mut out = Vec::new();
+            for (i, (elem_type, sub_binding)) in elements.into_iter().enumerate() {
+                let elem_val = extract_field(module, block, scrut, i as i32, elem_type, location)?;
+                out.extend(destructure_pattern(
+                    sub_binding,
+                    elem_val,
+                    block,
+                    module,
+                    location,
+                )?);
             }
             Ok(out)
         }

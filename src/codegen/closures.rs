@@ -111,6 +111,13 @@ pub(crate) fn free_variables(expr: &Expr) -> HashSet<String> {
             }
             fv
         }
+        ENode::Tuple(exprs) => {
+            let mut fv = HashSet::new();
+            for e in exprs {
+                union_into(&mut fv, free_variables(e));
+            }
+            fv
+        },
     }
 }
 
@@ -152,6 +159,13 @@ pub(crate) fn pattern_bound_vars(pat: &Expr) -> Vec<String> {
             let mut v = Vec::new();
             for fa in fields {
                 v.extend(pattern_bound_vars(&fa.exp));
+            }
+            v
+        }
+        ENode::Tuple(es) => {
+            let mut v = Vec::new();
+            for e in es {
+                v.extend(pattern_bound_vars(e));
             }
             v
         }

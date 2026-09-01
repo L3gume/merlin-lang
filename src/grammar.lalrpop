@@ -150,26 +150,25 @@ ExprBase: Box<Expr> = {
     <start:@L> <n:ConsName> <fs:RecordBody> <end:@R>                        => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Record(Some(n), fs))),
     <start:@L> <e:WithOperand> "with" <fs:RecordBody> <end:@R>              => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::With(e, fs))),
     Enum                                                                    => <>,
+    Tuple                                                                   => <>,
     Block                                                                   => <>
 };
 
+// A bare constructor name (`None`) is a variable; the compiler resolves it
+// against registered constructors. Constructor *application* `Some(x)` is
+// handled in `PostfixExpr` so it is a valid operand of any operator.
 Enum: Box<Expr> = {
-    // Enum constructor application: `Some(x)` / `Some(a, b)`. Desugars to a
-    // left-nested application `Some a b` so the typechecker and codegen see an
-    // ordinary function-applied-to-arguments. The constructor name is a bare
-    // `Variable`; the compiler resolves it against registered constructors.
-    <start:@L> <n:ConsName> "(" <es:CommaOne<Expr>> ")" <end:@R>            => {
-        let pos = Pos::bytes(start as u32, end as u32);
-        let mut e = Box::new(Expr::at(pos.clone(), ENode::Variable(n)));
-        for arg in es {
-            e = Box::new(Expr::at(pos.clone(), ENode::Application(e, arg)));
-        }
-        e
-    },
     <start:@L> <n:ConsName> <end:@R>                                        => {
         let pos = Pos::bytes(start as u32, end as u32);
         Box::new(Expr::at(pos.clone(), ENode::Variable(n)))
     },
+}
+
+// A parenthesized n-tuple `(e1, e2, ...)` with at least two elements (a single
+// element is just a parenthesized expression via `PostfixExpr`; `()` is the
+// unit literal).
+Tuple: Box<Expr> = {
+    <start:@L> "(" <es:CommaTwo<Expr>> ")" <end:@R>                         =>  Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Tuple(es.into_iter().map(|b| *b).collect()))),
 }
 
 WithOperand: Box<Expr> = {
@@ -240,7 +239,6 @@ UnaryExpr: Box<Expr> = {
     <start:@L> "-" <e:UnaryExpr> <end:@R> => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Unary(UnaryOp::Negate, e))),
     <start:@L> "!" <e:UnaryExpr> <end:@R> => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Unary(UnaryOp::Not, e))),
 }
-
 // --- Function application (highest binary precedence) ---
 AppExpr: Box<Expr> = {
     Atom                        => <>,
@@ -257,6 +255,17 @@ Atom: Box<Expr> = {
 
 PostfixExpr: Box<Expr> = {
     <start:@L> <n:Name> <end:@R>                        => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Variable(n))),
+    // Enum constructor application: `Some(x)` / `Some(a, b)`. Desugars to a
+    // left-nested application `Some a b` so the typechecker and codegen see an
+    // ordinary function-applied-to-arguments.
+    <start:@L> <n:ConsName> "(" <es:CommaOne<Expr>> ")" <end:@R>            => {
+        let pos = Pos::bytes(start as u32, end as u32);
+        let mut e = Box::new(Expr::at(pos.clone(), ENode::Variable(n)));
+        for arg in es {
+            e = Box::new(Expr::at(pos.clone(), ENode::Application(e, arg)));
+        }
+        e
+    },
     <start:@L> <e:PostfixExpr> "." <n:Name> <end:@R>    => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::FieldAccess(e, n))),
     "(" <e:Expr> ")"                                    => e
 }
@@ -311,6 +320,10 @@ Pipe<T>: Vec<T> = {
 
 CommaOne<T>: Vec<T> = {
     <e:T>                         => vec![e],
+    <mut v:CommaOne<T>> "," <e:T> => { v.push(e); v }
+};
+
+CommaTwo<T>: Vec<T> = {
     <mut v:CommaOne<T>> "," <e:T> => { v.push(e); v }
 };
 

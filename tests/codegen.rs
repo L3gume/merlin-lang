@@ -546,11 +546,11 @@ fn nested_list_equality() {
 
 #[test]
 fn enum_equality() {
-    assert!(expect_bool_prelude("Some 5 == Some 5;"));
-    assert!(!expect_bool_prelude("Some 5 == None;"));
-    assert!(expect_bool_prelude("Some 5 != None;"));
-    assert!(expect_bool_prelude("None == None;"));
-    assert!(expect_bool_prelude("Some 5 != Some 6;"));
+    assert!(expect_bool_prelude("Some(5) == Some(5);"));
+    assert!(!expect_bool_prelude("Some(5) == (None);"));
+    assert!(expect_bool_prelude("Some(5) != (None);"));
+    assert!(expect_bool_prelude("(None) == (None);"));
+    assert!(expect_bool_prelude("Some(5) != Some(6);"));
 }
 
 #[test]
@@ -588,14 +588,14 @@ fn record_equality_with_string_field() {
 #[test]
 fn record_equality_with_nested_option() {
     assert!(expect_bool_prelude(
-        "record P = { x: int, o: Option str };
-         let p1 = P { x: 1, o: Some \"hi\" };
-         let p2 = P { x: 1, o: Some \"hi\" };
+        "record P = { x: int, o: Option(str) };
+         let p1 = P { x: 1, o: Some(\"hi\") };
+         let p2 = P { x: 1, o: Some(\"hi\") };
          p1 == p2;"
     ));
     assert!(!expect_bool_prelude(
-        "record P = { x: int, o: Option str };
-         let p1 = P { x: 1, o: Some \"hi\" };
+        "record P = { x: int, o: Option(str) };
+         let p1 = P { x: 1, o: Some(\"hi\") };
          let p2 = P { x: 1, o: None };
          p1 == p2;"
     ));
@@ -607,20 +607,20 @@ fn recursive_enum_equality() {
     // equality helper is cached before its body is lowered.
     assert!(expect_bool(
         "enum Nat = Zero | Succ(Nat);
-         let two = Succ (Succ Zero);
-         two == Succ (Succ Zero);"
+         let two = Succ(Succ(Zero));
+         two == Succ(Succ(Zero));"
     ));
     assert!(!expect_bool(
         "enum Nat = Zero | Succ(Nat);
-         let two = Succ (Succ Zero);
-         two == Succ Zero;"
+         let two = Succ(Succ(Zero));
+         two == Succ(Zero);"
     ));
 }
 
 #[test]
 fn list_of_options_equality() {
-    assert!(expect_bool_prelude("[Some 1, None] == [Some 1, None];"));
-    assert!(!expect_bool_prelude("[Some 1, None] == [Some 1, Some 2];"));
+    assert!(expect_bool_prelude("[Some(1), None] == [Some(1), None];"));
+    assert!(!expect_bool_prelude("[Some(1), None] == [Some(1), Some(2)];"));
 }
 
 // ----------------------------------------------------------------------------
@@ -632,8 +632,8 @@ fn n_ary_enum_construct_and_match() {
     assert_eq!(
         expect_int(
             "enum Trio = T(int, int, int);
-             let sum = \\t => match t | T a b c => a + b + c | _ => 0;
-             sum (T 1 2 3);"
+             let sum = \\t => match t | T(a, b, c) => a + b + c | _ => 0;
+             sum (T(1, 2, 3));"
         ),
         6
     );
@@ -644,8 +644,8 @@ fn n_ary_enum_pattern_with_literal_field() {
     assert_eq!(
         expect_int(
             "enum Trio = T(int, int, int);
-             let mid = \\t => match t | T a 2 c => a + c | _ => 0;
-             mid (T 1 2 3);"
+             let mid = \\t => match t | T(a, 2, c) => a + c | _ => 0;
+             mid (T(1, 2, 3));"
         ),
         4
     );
@@ -656,8 +656,8 @@ fn n_ary_enum_pattern_all_literals() {
     assert_eq!(
         expect_int(
             "enum Trio = T(int, int, int);
-             let is_it = \\t => match t | T 1 2 3 => 42 | _ => 0;
-             is_it (T 1 2 3);"
+             let is_it = \\t => match t | T(1, 2, 3) => 42 | _ => 0;
+             is_it (T(1, 2, 3));"
         ),
         42
     );
