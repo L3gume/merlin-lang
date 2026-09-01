@@ -147,8 +147,13 @@ ConsOperand: Box<Expr> = {
 
 ExprBase: Box<Expr> = {
     LogExpr                                                                 => <>,
-    <start:@L> <n:ConsName> <fs:RecordBody> <end:@R>                            => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Record(Some(n), fs))),
+    <start:@L> <n:ConsName> <fs:RecordBody> <end:@R>                        => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Record(Some(n), fs))),
     <start:@L> <e:WithOperand> "with" <fs:RecordBody> <end:@R>              => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::With(e, fs))),
+    Enum                                                                    => <>,
+    Block                                                                   => <>
+};
+
+Enum: Box<Expr> = {
     // Enum constructor application: `Some(x)` / `Some(a, b)`. Desugars to a
     // left-nested application `Some a b` so the typechecker and codegen see an
     // ordinary function-applied-to-arguments. The constructor name is a bare
@@ -161,8 +166,11 @@ ExprBase: Box<Expr> = {
         }
         e
     },
-    Block                                                                   => <>
-};
+    <start:@L> <n:ConsName> <end:@R>                                        => {
+        let pos = Pos::bytes(start as u32, end as u32);
+        Box::new(Expr::at(pos.clone(), ENode::Variable(n)))
+    },
+}
 
 WithOperand: Box<Expr> = {
     PostfixExpr                                                             => <>,
