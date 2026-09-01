@@ -408,13 +408,13 @@ fn lambda_with_function_type_annotation() {
 
 #[test]
 fn lambda_with_enum_type_annotation() {
-    let p = parse("\\(x : option int) => x;");
+    let p = parse("\\(x : Option(int)) => x;");
     assert_eq!(
         &*first(&p).s,
         &SNode::Expr(Box::new(Expr::from(ENode::Abstraction(
             Box::new(Binding(
                 "x".to_string(),
-                mono(Monotype::enum_app("option".to_string(), vec![Monotype::int()])),
+                mono(Monotype::enum_app("Option".to_string(), vec![Monotype::int()])),
             )),
             Box::new(Expr::from(ENode::Variable("x".to_string()))),
         ))))
@@ -423,14 +423,14 @@ fn lambda_with_enum_type_annotation() {
 
 #[test]
 fn lambda_with_multi_arg_enum_type_annotation() {
-    let p = parse("\\(x : result int bool) => x;");
+    let p = parse("\\(x : Result(int, bool)) => x;");
     assert_eq!(
         &*first(&p).s,
         &SNode::Expr(Box::new(Expr::from(ENode::Abstraction(
             Box::new(Binding(
                 "x".to_string(),
                 mono(Monotype::enum_app(
-                    "result".to_string(),
+                    "Result".to_string(),
                     vec![Monotype::int(), Monotype::bool()],
                 )),
             )),
@@ -441,20 +441,96 @@ fn lambda_with_multi_arg_enum_type_annotation() {
 
 #[test]
 fn lambda_with_parenthesized_enum_type_annotation() {
-    let p = parse("\\(x : option (list int)) => x;");
+    let p = parse("\\(x : Option(list int)) => x;");
     assert_eq!(
         &*first(&p).s,
         &SNode::Expr(Box::new(Expr::from(ENode::Abstraction(
             Box::new(Binding(
                 "x".to_string(),
                 mono(Monotype::enum_app(
-                    "option".to_string(),
+                    "Option".to_string(),
                     vec![Monotype::list(Monotype::int())],
                 )),
             )),
             Box::new(Expr::from(ENode::Variable("x".to_string()))),
         ))))
     );
+}
+
+#[test]
+fn lambda_with_nullary_enum_type_annotation() {
+    let p = parse("\\(x : Maybe) => x;");
+    assert_eq!(
+        &*first(&p).s,
+        &SNode::Expr(Box::new(Expr::from(ENode::Abstraction(
+            Box::new(Binding(
+                "x".to_string(),
+                mono(Monotype::enum_app("Maybe".to_string(), vec![])),
+            )),
+            Box::new(Expr::from(ENode::Variable("x".to_string()))),
+        ))))
+    );
+}
+
+#[test]
+fn lambda_with_nested_enum_type_annotation() {
+    let p = parse("\\(x : Option(Result(int, bool))) => x;");
+    assert_eq!(
+        &*first(&p).s,
+        &SNode::Expr(Box::new(Expr::from(ENode::Abstraction(
+            Box::new(Binding(
+                "x".to_string(),
+                mono(Monotype::enum_app(
+                    "Option".to_string(),
+                    vec![Monotype::enum_app(
+                        "Result".to_string(),
+                        vec![Monotype::int(), Monotype::bool()],
+                    )],
+                )),
+            )),
+            Box::new(Expr::from(ENode::Variable("x".to_string()))),
+        ))))
+    );
+}
+
+#[test]
+fn enum_constructor_desugars_to_application() {
+    let p = parse("Some(42);");
+    assert_eq!(
+        &*first(&p).s,
+        &SNode::Expr(Box::new(Expr::from(ENode::Application(
+            Box::new(Expr::from(ENode::Variable("Some".to_string()))),
+            Box::new(Expr::from(ENode::Literal(Box::new(Lit::Int(42))))),
+        ))))
+    );
+}
+
+#[test]
+fn multi_arg_enum_constructor_desugars_to_nested_application() {
+    let p = parse("Pair(1, 2);");
+    assert_eq!(
+        &*first(&p).s,
+        &SNode::Expr(Box::new(Expr::from(ENode::Application(
+            Box::new(Expr::from(ENode::Application(
+                Box::new(Expr::from(ENode::Variable("Pair".to_string()))),
+                Box::new(Expr::from(ENode::Literal(Box::new(Lit::Int(1))))),
+            ))),
+            Box::new(Expr::from(ENode::Literal(Box::new(Lit::Int(2))))),
+        ))))
+    );
+}
+
+#[test]
+fn enum_constructor_pattern_desugars_to_application() {
+    let p = parse("match x | Some(n) => n | None => 0;");
+    let SNode::Expr(e) = &*first(&p).s else { panic!("expected Expr") };
+    let ENode::Match(_, cases) = &*e.e else { panic!("expected Match") };
+    assert_eq!(cases.len(), 2);
+    let ENode::Application(f, arg) = &*cases[0].val.e else { panic!("expected Application pattern") };
+    assert_eq!(f.e, Box::new(ENode::Variable("Some".to_string())));
+    assert_eq!(arg.e, Box::new(ENode::Variable("n".to_string())));
+    let ENode::Variable(name) = &*cases[1].val.e else { panic!("expected Variable pattern") };
+    assert_eq!(name, "None");
 }
 
 // ---- Let-in expression ----
@@ -959,6 +1035,15 @@ fn typecheck_int_literal() {
 #[test]
 fn typecheck_let_decl() {
     let mut p = parse("let x = 42;");
+    assert!(Program::typecheck(&mut p).is_ok());
+}
+
+#[test]
+fn typecheck_enum_constructor_pattern() {
+    let mut p = parse(
+        "enum Maybe('a) = Just('a) | Nothing; \
+         let get = \\(m : Maybe(int)) => match m | Just(n) => n | Nothing => 0;",
+    );
     assert!(Program::typecheck(&mut p).is_ok());
 }
 

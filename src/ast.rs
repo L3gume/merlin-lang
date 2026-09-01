@@ -308,8 +308,7 @@ pub enum ENode {
     Match(Box<Expr>, Vec<MatchCase>),
     FieldAccess(Box<Expr>, String),
     Record(Option<String>, Vec<FieldAssn>),
-    With(Box<Expr>, Vec<FieldAssn>)
-    
+    With(Box<Expr>, Vec<FieldAssn>),
 }
 
 impl Display for ENode {

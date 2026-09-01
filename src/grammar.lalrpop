@@ -33,19 +33,19 @@ TypeBase: Box<Type> = {
     "(" <t:Type> ")"            => t,
 };
 
-// Enum applications: `Name t1 t2 ... tn` (space-separated), greedy and
-// left-associative, mirroring AppExpr in the expression grammar. An application
-// operand (AppArg) sits one level below AppType so the greedy application stays
-// LALR(1)-parseable: a `Name` operand is a bare constructor, so nesting an
-// application requires parens: `option (maybe int)`.
+// Enum applications: `ConsName(typevar1, ..., typevarn)`, e.g. `Option(int)`
+// or `Result(int, str)`. Arguments (AppArg) sit one level below AppType so the
+// bracket-delimited application stays LALR(1)-parseable; a bare `ConsName`
+// argument is a nullary constructor, and nested applications are allowed.
 AppType: Box<Type> = {
-    Name                                    => Box::new(Type { t: Monotype::enum_type(<>) }),
-    <t1:AppType> <t2:AppArg>                => Box::new(Type { t: Monotype::enum_apply(t1.t, t2.t) }),
+    <n:ConsName>                                                    => Box::new(Type { t: Monotype::enum_type(n) }),
+    <n:ConsName> "(" <ts:CommaOne<AppArg>> ")"                      => Box::new(Type { t: Monotype::enum_app(n, ts.into_iter().map(|b| b.t).collect()) }),
 }
 
 AppArg: Box<Type> = {
     BuiltinType                 => <>,
-    Name                        => Box::new(Type { t: Monotype::enum_type(<>) }),
+    ConsName                    => Box::new(Type { t: Monotype::enum_type(<>) }),
+    <n:ConsName> "(" <ts:CommaOne<AppArg>> ")"  => Box::new(Type { t: Monotype::enum_app(n, ts.into_iter().map(|b| b.t).collect()) }),
     TypeVar                     => Box::new(Type { t: Monotype::var(<>) }),
     "list" <t:AppArg>           => Box::new(Type { t: Monotype::list(t.t) }),
     "(" <t:Type> ")"            => t,
@@ -66,7 +66,7 @@ TypeDecl: Stmt = {
 }
 
 TypeHeader: TypeHeader = {
-    <n:Name> <ts:OptTypeVars> "=" => TypeHeader { n: n, tvars: ts }
+    <n:ConsName> <ts:OptTypeVars> "=" => TypeHeader { n: n, tvars: ts }
 }
 
 OptTypeVars : Vec<String> = {
@@ -79,8 +79,8 @@ TypeVar: String = {
 }
 
 Variant: Variant = {
-    <n:Name>                             => Variant { n: n, tparams: vec![] },
-    <n:Name> "(" <ts:CommaOne<Type>> ")" => Variant { n: n, tparams: ts.into_iter().map(|b| *b).collect() }
+    <n:ConsName>                             => Variant { n: n, tparams: vec![] },
+    <n:ConsName> "(" <ts:CommaOne<Type>> ")" => Variant { n: n, tparams: ts.into_iter().map(|b| *b).collect() }
 }
 
 // ----------------------------------------------------------------------------
@@ -147,8 +147,20 @@ ConsOperand: Box<Expr> = {
 
 ExprBase: Box<Expr> = {
     LogExpr                                                                 => <>,
-    <start:@L> <n:Name> <fs:RecordBody> <end:@R>                            => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Record(Some(n), fs))),
+    <start:@L> <n:ConsName> <fs:RecordBody> <end:@R>                            => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::Record(Some(n), fs))),
     <start:@L> <e:WithOperand> "with" <fs:RecordBody> <end:@R>              => Box::new(Expr::at(Pos::bytes(start as u32, end as u32), ENode::With(e, fs))),
+    // Enum constructor application: `Some(x)` / `Some(a, b)`. Desugars to a
+    // left-nested application `Some a b` so the typechecker and codegen see an
+    // ordinary function-applied-to-arguments. The constructor name is a bare
+    // `Variable`; the compiler resolves it against registered constructors.
+    <start:@L> <n:ConsName> "(" <es:CommaOne<Expr>> ")" <end:@R>            => {
+        let pos = Pos::bytes(start as u32, end as u32);
+        let mut e = Box::new(Expr::at(pos.clone(), ENode::Variable(n)));
+        for arg in es {
+            e = Box::new(Expr::at(pos.clone(), ENode::Application(e, arg)));
+        }
+        e
+    },
     Block                                                                   => <>
 };
 
@@ -251,7 +263,11 @@ TypedBinding : Binding = {
 }
 
 Name: String = {
-    r"[a-zA-Z_][a-zA-Z0-9_]*"   => <>.to_string()
+    r"[a-z_][a-zA-Z0-9_]*"   => <>.to_string()
+};
+
+ConsName: String = {
+    r"[A-Z][a-zA-Z0-9_]*"   => <>.to_string()
 };
 
 Literal: Box<Lit> = {

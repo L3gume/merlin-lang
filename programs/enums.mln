@@ -1,14 +1,14 @@
 
-let get_opt = \x => Some x;
+let get_opt = \x => Some(x);
 let get_none = \(x:int) => None;
 
 let get_res = \opt => match opt
-    | Some val  => Ok val
-    | None      => Err "No value found"
+    | Some(val)  => Ok(val)
+    | None       => Err("No value found")
     ;
 
 match get_res (get_none 1)
-| Err msg => print msg
+| Err(msg) => print msg
 | _ => print "failed";
 
 println "";

@@ -1,7 +1,7 @@
 record Foo =
     {
         bar : int,
-        baz : Option str
+        baz : Option(str)
     };
 
 record Bar =
@@ -24,15 +24,15 @@ let print_foo = \foo => println (match foo
         | Foo { bar: 69, baz: _ } => "nice!"
         | Foo { bar: n, baz: maybe_str } => (
             match maybe_str
-            | Some s => s
+            | Some(s) => s
             | None => "None str"
         )
         | _ => "didn't match"
     );
 
-let x1 = Foo { bar: 69, baz: Some "420" };
+let x1 = Foo { bar: 69, baz: Some("420") };
 let x2 = Foo { bar: 420, baz: None };
-let x3 = Bar { thing: 69, other: Foo { bar: 420, baz: Some "This is a string" } };
+let x3 = Bar { thing: 69, other: Foo { bar: 420, baz: Some("This is a string") } };
 
 print_foo x1;
 print_foo (x1 with { bar: 420 });

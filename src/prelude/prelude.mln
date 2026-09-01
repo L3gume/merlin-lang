@@ -14,10 +14,10 @@ enum Result('a, 'err)=
     Ok('a)
     | Err('err);
 
-let opt = \x => Some x;
+let opt = \x => Some(x);
 
 let get_or_else = \opt default => match opt
-    | Some x => x
+    | Some(x) => x
     | None => default;
 
 let odd = \(i : int) => match i % 2
@@ -33,12 +33,12 @@ let even = \(i : int) => !(odd i);
 # first element
 let head = \ls => match ls
     | [] => None
-    | x::xs => Some x;
+    | x::xs => Some(x);
 
 # list tail (Option)
 let tail = \ls => match ls
     | [] => None
-    | x::xs => Some xs;
+    | x::xs => Some(xs);
 
 # last element
 let last = \ls =>
@@ -47,12 +47,12 @@ let last = \ls =>
         | x::xs => aux xs x)
     in match ls
     | [] => None
-    | x::xs => Some (aux xs x);
+    | x::xs => Some(aux xs x);
 
 # get at index
 let get_i = \idx ls => match ls
     | [] => None
-    | x::xs => (if idx == 0 then Some x else get_i (idx - 1) xs);
+    | x::xs => (if idx == 0 then Some(x) else get_i (idx - 1) xs);
 
 # list length
 let len = \ls =>
@@ -138,11 +138,11 @@ let all = \pred ls => match ls
 
 let find = \pred ls => match ls
     | [] => None
-    | x::xs => (if pred x then Some x else find pred xs);
+    | x::xs => (if pred x then Some(x) else find pred xs);
 
 let find_val = \val ls => match ls
     | [] => None
-    | x::xs => (if x == val then Some x else find_val val xs);
+    | x::xs => (if x == val then Some(x) else find_val val xs);
 
 # tail-recursive filter
 let tfilter = \pred ls =>

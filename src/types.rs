@@ -1,4 +1,3 @@
-use core::panic;
 use std::fmt::Display;
 use std::sync::OnceLock;
 use std::collections::{HashMap, HashSet};
@@ -45,8 +44,14 @@ impl Display for Monotype {
                     TypeFunc::Char => write!(f, "Char"),
                     TypeFunc::Fn => write!(f, "{} -> {}", monotypes[0], monotypes[1]),
                     TypeFunc::List => write!(f, "list {}", monotypes[0]),
-                    TypeFunc::Enum(n) => write!(f, "{} {}", n,
-                        monotypes.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(" ")),
+                    TypeFunc::Enum(n) => {
+                        if monotypes.is_empty() {
+                            write!(f, "{}", n)
+                        } else {
+                            write!(f, "{}({})", n,
+                                monotypes.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", "))
+                        }
+                    }
                     TypeFunc::Rec => {
                         write!(f, "{{")?;
                         fmt_row(f, &monotypes[0])?;
@@ -174,16 +179,6 @@ impl Monotype {
 
     pub fn enum_app(name : String, vars : Vec<Monotype>) -> Monotype {
         Monotype::TypeFuncApplication(Box::new(TypeFunc::Enum(name)), vars)
-    }
-
-    pub fn enum_apply(typ : Monotype, arg : Monotype) -> Monotype {
-        match typ {
-            Monotype::TypeFuncApplication(f, mut args) => {
-                args.push(arg);
-                Monotype::TypeFuncApplication(f, args)
-            }
-            _ => panic!("enum_apply: expected an enum application"),
-        }
     }
 
     pub fn rec(row: Monotype) -> Monotype {

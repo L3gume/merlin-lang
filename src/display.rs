@@ -46,7 +46,7 @@ fn render_type_inner(t: &Monotype, vars: &mut HashMap<String, String>) -> String
                     name.clone()
                 } else {
                     let rendered: Vec<String> = args.iter().map(|a| render_type_inner(a, vars)).collect();
-                    format!("{} {}", name, rendered.join(" "))
+                    format!("{}({})", name, rendered.join(", "))
                 }
             }
             TypeFunc::Rec => todo!(),
