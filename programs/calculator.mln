@@ -1,0 +1,16 @@
+enum Operation =
+    Plus(Operation, Operation)
+    | Minus(Operation, Operation)
+    | Times(Operation, Operation)
+    | Div(Operation, Operation)
+    | Val(float);
+
+let eval = \operation => match operation
+    | Plus(op1, op2) => (eval op1) + (eval op2)
+    | Minus(op1, op2) => (eval op1) - (eval op2)
+    | Times(op1, op2) => (eval op1) * (eval op2)
+    | Div(op1, op2) => (eval op1) / (eval op2)
+    | Val(v) => v;
+
+println (ftostr (eval Plus(Times(Val(2.0), Val(2.0)), Val(4.0))));
+

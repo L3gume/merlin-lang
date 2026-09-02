@@ -2,12 +2,7 @@ let names = ["bob", "john", "alice"];
 let numbers = [2, 42, 73];
 
 let print_num_name = \tup => match tup
-    | (num, name) => {
-            print (itostr num);
-            print ": ";
-            print name;
-            print "\n"
-        }
+    | (num, name) => print ((itostr num) + ": " + name + "\n")
     | _ => ();
 
 iter print_num_name (zip numbers names);
