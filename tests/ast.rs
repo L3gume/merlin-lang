@@ -1122,6 +1122,44 @@ fn match_list_incomplete_rejected() {
 }
 
 #[test]
+fn match_enum_all_variants_exhaustive() {
+    let mut p = parse(
+        "enum Maybe('a) = Just('a) | Nothing; \
+         let get = \\(m : Maybe(int)) => match m | Just(n) => n | Nothing => 0;",
+    );
+    assert!(Program::typecheck(&mut p).is_ok());
+}
+
+#[test]
+fn match_enum_missing_variant_rejected() {
+    let mut p = parse(
+        "enum Maybe('a) = Just('a) | Nothing; \
+         let get = \\(m : Maybe(int)) => match m | Just(n) => n;",
+    );
+    assert!(Program::typecheck(&mut p).is_err());
+}
+
+#[test]
+fn match_enum_nullary_variant_is_not_catch_all() {
+    // `Nothing` is a nullary constructor pattern, so without it (and without a
+    // real catch-all) the match is not exhaustive.
+    let mut p = parse(
+        "enum Maybe('a) = Just('a) | Nothing; \
+         let get = \\(m : Maybe(int)) => match m | Just(n) => n;",
+    );
+    assert!(Program::typecheck(&mut p).is_err());
+}
+
+#[test]
+fn match_enum_catch_all_accepted() {
+    let mut p = parse(
+        "enum Maybe('a) = Just('a) | Nothing; \
+         let get = \\(m : Maybe(int)) => match m | Just(n) => n | other => 0;",
+    );
+    assert!(Program::typecheck(&mut p).is_ok());
+}
+
+#[test]
 fn typecheck_undefined_variable() {
     let mut p = parse("x;");
     assert!(Program::typecheck(&mut p).is_err());

@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::sync::OnceLock;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::types::Monotype::TypeFuncApplication;
@@ -300,7 +300,8 @@ pub struct TypeContext {
     type_var_ctr : u32,
     pub variables : HashMap<String, Polytype>,
     type_aliases : HashMap<String, TypeAlias>,
-    enum_names : HashSet<String>,
+    /// Enum name → its variant names, in declaration order.
+    enums : HashMap<String, Vec<String>>,
 }
 
 impl Default for TypeContext {
@@ -315,7 +316,7 @@ impl TypeContext {
             type_var_ctr : 0,
             variables : HashMap::new(),
             type_aliases : HashMap::new(),
-            enum_names : HashSet::new(),
+            enums : HashMap::new(),
         };
         for (name, poly) in builtins() {
             ctx.variables.insert(name.clone(), poly.clone());
@@ -328,7 +329,7 @@ impl TypeContext {
             type_var_ctr : 0,
             variables : map,
             type_aliases : HashMap::new(),
-            enum_names : HashSet::new(),
+            enums : HashMap::new(),
         }
     }
 
@@ -352,12 +353,17 @@ impl TypeContext {
         self.type_aliases.get(name)
     }
 
-    pub fn add_enum_name(&mut self, name : String) {
-        self.enum_names.insert(name);
+    pub fn add_enum(&mut self, name : String, variants : Vec<String>) {
+        self.enums.insert(name, variants);
     }
 
     pub fn has_enum_name(&self, name : &str) -> bool {
-        self.enum_names.contains(name)
+        self.enums.contains_key(name)
+    }
+
+    /// The variant names of a declared enum, in declaration order.
+    pub fn enum_variants(&self, name : &str) -> Option<&Vec<String>> {
+        self.enums.get(name)
     }
 
     pub fn apply(&self, sub : &Substitution) -> TypeContext {
@@ -365,7 +371,7 @@ impl TypeContext {
             type_var_ctr: self.type_var_ctr,
             variables: self.variables.iter().map(|(k, t)| (k.clone(), t.apply(sub))).collect(),
             type_aliases: self.type_aliases.clone(),
-            enum_names: self.enum_names.clone(),
+            enums: self.enums.clone(),
         }
     }
 
@@ -428,7 +434,7 @@ pub fn unify(context: &mut TypeContext, typ1 : &Monotype, typ2 : &Monotype) -> R
         // unification (label commutation); the generic pointwise case below
         // would wrongly reject or mis-unify them.
         (Monotype::TypeFuncApplication(f1, _), Monotype::TypeFuncApplication(f2, _))
-            if is_row_ctor(&**f1) || is_row_ctor(&**f2) =>
+            if is_row_ctor(f1) || is_row_ctor(f2) =>
             unify_row(context, typ1, typ2),
         (Monotype::TypeFuncApplication(f1, ts1),
             Monotype::TypeFuncApplication(f2, ts2 )) => {
@@ -604,7 +610,7 @@ pub fn handle_type_decl(header : &TypeHeader, dec : &TypeDec, context : &mut Typ
     }
     match dec {
         TypeDec::Enum(variants) => {
-            context.add_enum_name(header.n.clone());
+            context.add_enum(header.n.clone(), variants.iter().map(|v| v.n.clone()).collect());
             let enum_typ = Monotype::enum_app(header.n.clone(), fresh_vars);
             for variant in variants {
                 let mut ctor = enum_typ.clone();
@@ -640,10 +646,19 @@ pub fn handle_type_decl(header : &TypeHeader, dec : &TypeDec, context : &mut Typ
 /// Reject non-exhaustive `match`es.
 ///
 /// A variable pattern covers everything. Otherwise the scrutinee type decides
-/// what must be covered: a `bool` needs both `true` and `false`, and a `list`
-/// needs both `[]` and a cons pattern. Every other scrutinee type has
-/// infinitely many (or unenumerable) values, so a catch-all is required.
-fn check_exhaustive(match_t : &Monotype, cases : &[MatchCase]) -> Result<(), UnificationError> {
+/// what must be covered: a `bool` needs both `true` and `false`, a `list`
+/// needs both `[]` and a cons pattern, and an `enum` needs every one of its
+/// declared variants. Every other scrutinee type has infinitely many (or
+/// unenumerable) values, so a catch-all is required.
+fn check_exhaustive(context : &TypeContext, match_t : &Monotype, cases : &[MatchCase]) -> Result<(), UnificationError> {
+    // Enum scrutinees are handled before the generic catch-all shortcut: a
+    // nullary constructor pattern (e.g. `None`) is also an `ENode::Variable`
+    // and would otherwise be mistaken for a catch-all.
+    if let Monotype::TypeFuncApplication(f, _) = match_t
+        && let TypeFunc::Enum(name) = &**f
+    {
+        return check_enum_exhaustive(context, name, match_t, cases);
+    }
     if cases.iter().any(|c| matches!(&*c.val.e, ENode::Variable(_))) {
         return Ok(());
     }
@@ -667,6 +682,48 @@ fn check_exhaustive(match_t : &Monotype, cases : &[MatchCase]) -> Result<(), Uni
             }
         },
         _ => Err(UnificationError { pos: None, message: format!("Match on {:?} is not exhaustive: add a catch-all variable pattern", match_t) }),
+    }
+}
+
+/// Check an enum scrutinee covers every declared variant. A variable pattern
+/// whose name is not one of the enum's (nullary) constructors is a catch-all;
+/// otherwise the constructor names used by the cases are compared against the
+/// enum's variants.
+fn check_enum_exhaustive(context : &TypeContext, name : &str, match_t : &Monotype, cases : &[MatchCase]) -> Result<(), UnificationError> {
+    let Some(variants) = context.enum_variants(name) else {
+        return Err(UnificationError { pos: None, message: format!("Match on {:?} is not exhaustive: add a catch-all variable pattern", match_t) });
+    };
+    if cases.iter().any(|c| match &*c.val.e {
+        ENode::Variable(v) => !variants.contains(v),
+        _ => false,
+    }) {
+        return Ok(());
+    }
+    let covered : Vec<String> = cases.iter()
+        .filter_map(|c| pattern_ctor_name(&c.val))
+        .collect();
+    let missing : Vec<String> = variants.iter()
+        .filter(|v| !covered.contains(v))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(UnificationError { pos: None, message: format!("Match on enum `{}` is not exhaustive: missing variant(s) {:?}", name, missing) })
+    }
+}
+
+/// The constructor name a case pattern uses, if any: the head variable of a
+/// (possibly left-nested) constructor application, or the bare variable itself
+/// for a nullary constructor pattern.
+fn pattern_ctor_name(pat : &Expr) -> Option<String> {
+    let mut head = pat;
+    loop {
+        match &*head.e {
+            ENode::Application(f, _) => head = f,
+            ENode::Variable(n) => return Some(n.clone()),
+            _ => return None,
+        }
     }
 }
 
@@ -868,7 +925,7 @@ fn infer_match(context : &mut TypeContext, e : &mut Box<Expr>, cases : &mut Vec<
         combined = combined.combine(s_u);
         match_t = match_t.apply(&combined);
     }
-    check_exhaustive(&match_t, cases)?;
+    check_exhaustive(context, &match_t, cases)?;
     let resolved_ret = ret.apply(&combined);
     Ok((combined, resolved_ret))
 }
