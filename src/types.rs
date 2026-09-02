@@ -284,6 +284,8 @@ pub(crate) fn builtins() -> &'static [(String, Polytype)] {
             ("itof".to_string(),        mono(Monotype::func(vec![Monotype::int(), Monotype::float()]))),
             ("ftoi".to_string(),        mono(Monotype::func(vec![Monotype::float(), Monotype::int()]))),
             ("readin".to_string(),      mono(Monotype::func(vec![Monotype::unit(), Monotype::string()]))),
+            ("tochars".to_string(),     mono(Monotype::func(vec![Monotype::string(), Monotype::list(Monotype::char())]))),
+            ("fromchars".to_string(),   mono(Monotype::func(vec![Monotype::list(Monotype::char()), Monotype::string()]))),
         ]
     })
 }

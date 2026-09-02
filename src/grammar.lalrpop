@@ -56,6 +56,7 @@ BuiltinType: Box<Type> = {
     "bool"      => Box::new(Type { t: Monotype::bool() }),
     "float"     => Box::new(Type { t: Monotype::float() }),
     "str"       => Box::new(Type { t: Monotype::string() }),
+    "char"      => Box::new(Type { t: Monotype::char() }),
     "()"        => Box::new(Type { t: Monotype::unit() }),
 };
 

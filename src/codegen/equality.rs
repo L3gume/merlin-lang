@@ -168,7 +168,8 @@ fn lower_scalar_eq<'c, 'a>(
     location: Location<'c>,
 ) -> Result<Value<'c, 'a>, String> {
     match typ {
-        Monotype::TypeFuncApplication(f, _) if matches!(**f, TypeFunc::Int | TypeFunc::Bool) => {
+        Monotype::TypeFuncApplication(f, _)
+            if matches!(**f, TypeFunc::Int | TypeFunc::Bool | TypeFunc::Char | TypeFunc::Unit) => {
             let op = arith::cmpi(module.context, arith::CmpiPredicate::Eq, lhs, rhs, location);
             block
                 .append_operation(op)

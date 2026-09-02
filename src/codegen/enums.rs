@@ -69,29 +69,39 @@ pub(crate) fn build_payload<'c, 'a>(
     Ok(ptr)
 }
 
-/// Bindings produced by destructuring a match pattern.
+/// Bindings produced by destructuring a match pattern. Recurses so nested
+/// tuples, records, lists, and constructor patterns are handled.
 pub(crate) enum PatternBind<'c> {
     /// A bare variable sub-pattern bound directly to the scrutinee value.
     Var { name: String },
-    /// `x::xs`: load the head/tail fields of a cons cell.
-    Cons { head_name: String, head_type: Type<'c>, tail_name: String },
-    /// A constructor pattern: load the variable sub-patterns from the enum's
+    /// A pattern that binds nothing (a literal, `[]`, or a nullary
+    /// constructor).
+    Nil,
+    /// `x::xs` / `[a, b, ..]`: load the head/tail fields of a cons cell and
+    /// destructure each sub-pattern against them.
+    Cons {
+        head: Box<PatternBind<'c>>,
+        head_type: Type<'c>,
+        tail: Box<PatternBind<'c>>,
+        tail_type: Type<'c>,
+    },
+    /// A constructor pattern: load the sub-patterns' bindings from the enum's
     /// `data` pointer. `field_types` are the full payload field types in
-    /// declaration order (for the payload struct layout); `binds` maps each
-    /// bound variable to its payload field index (literals bind nothing).
-    Enum { field_types: Vec<Type<'c>>, binds: Vec<(String, usize)> },
+    /// declaration order (for the payload struct layout); `binds` holds one
+    /// sub-pattern per field, aligned with `field_types` (`Nil` for literal
+    /// sub-patterns).
+    Enum { field_types: Vec<Type<'c>>, binds: Vec<PatternBind<'c>> },
     /// `Foo { bar: n, .. }`: extract the named fields of a record scrutinee.
-    /// Each entry is `(bound var, field type, field index)`.
-    Record { fields: Vec<(String, Type<'c>, usize)> },
+    /// Each entry is `(field name, field type, field index, sub-pattern)`.
+    Record { fields: Vec<(String, Type<'c>, usize, PatternBind<'c>)> },
     /// `(p1, ..., pn)`: destructure a tuple scrutinee, recursing into each
-    /// element's sub-pattern. Each entry is `(element type, sub-binding)`;
-    /// a `None` sub-binding means the element pattern binds nothing.
-    Tuple { elements: Vec<(Type<'c>, Option<PatternBind<'c>>)> },
+    /// element's sub-pattern. Each entry is `(element type, sub-binding)`.
+    Tuple { elements: Vec<(Type<'c>, PatternBind<'c>)> },
 }
 
 /// Load the bindings of a match pattern inside `block`.
 pub(crate) fn destructure_pattern<'c, 'x>(
-    binding: Option<PatternBind<'c>>,
+    binding: PatternBind<'c>,
     scrut: Value<'c, 'x>,
     block: &'x Block<'c>,
     module: &mut Module<'c>,
@@ -100,15 +110,20 @@ pub(crate) fn destructure_pattern<'c, 'x>(
     let ptr = Type::parse(module.context, "!llvm.ptr")
         .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string())?;
     match binding {
-        None => Ok(vec![]),
-        Some(PatternBind::Var { name }) => Ok(vec![(name, scrut)]),
-        Some(PatternBind::Cons { head_name, head_type, tail_name }) => {
+        PatternBind::Nil => Ok(vec![]),
+        PatternBind::Var { name } => Ok(vec![(name, scrut)]),
+        PatternBind::Cons { head, head_type, tail, tail_type } => {
             let cell = cell_struct_type(module, head_type)?;
-            let head = load_field(module, block, scrut, cell, 0, head_type, location)?;
-            let tail = load_field(module, block, scrut, cell, 1, ptr, location)?;
-            Ok(vec![(head_name, head), (tail_name, tail)])
+            let head_val = load_field(module, block, scrut, cell, 0, head_type, location)?;
+            let tail_val = load_field(module, block, scrut, cell, 1, tail_type, location)?;
+            let mut out = destructure_pattern(*head, head_val, block, module, location)?;
+            out.extend(destructure_pattern(*tail, tail_val, block, module, location)?);
+            Ok(out)
         }
-        Some(PatternBind::Enum { field_types, binds }) => {
+        PatternBind::Enum { field_types, binds } => {
+            if field_types.is_empty() {
+                return Ok(vec![]);
+            }
             let enum_struct = enum_struct_type(module)?;
             let data = load_field(module, block, scrut, enum_struct, 1, ptr, location)?;
             let names: Vec<String> = field_types.iter().map(|t| t.to_string()).collect();
@@ -118,39 +133,42 @@ pub(crate) fn destructure_pattern<'c, 'x>(
             )
             .ok_or_else(|| "codegen: failed to create payload struct type".to_string())?;
             let mut out = Vec::new();
-            for (name, index) in binds {
-                let v = load_field(
+            for (i, (field_type, sub_binding)) in field_types.iter().zip(binds).enumerate() {
+                if let PatternBind::Nil = &sub_binding {
+                    continue;
+                }
+                let field_val = load_field(
                     module,
                     block,
                     data,
                     payload_struct,
-                    index as i32,
-                    field_types[index],
+                    i as i32,
+                    *field_type,
                     location,
                 )?;
-                out.push((name, v));
+                out.extend(destructure_pattern(sub_binding, field_val, block, module, location)?);
             }
             Ok(out)
         }
-        Some(PatternBind::Record { fields }) => {
+        PatternBind::Record { fields } => {
             let mut out = Vec::new();
-            for (name, ty, index) in fields {
+            for (_name, ty, index, sub) in fields {
+                if let PatternBind::Nil = &sub {
+                    continue;
+                }
                 let v = extract_field(module, block, scrut, index as i32, ty, location)?;
-                out.push((name, v));
+                out.extend(destructure_pattern(sub, v, block, module, location)?);
             }
             Ok(out)
         }
-        Some(PatternBind::Tuple { elements }) => {
+        PatternBind::Tuple { elements } => {
             let mut out = Vec::new();
             for (i, (elem_type, sub_binding)) in elements.into_iter().enumerate() {
+                if let PatternBind::Nil = &sub_binding {
+                    continue;
+                }
                 let elem_val = extract_field(module, block, scrut, i as i32, elem_type, location)?;
-                out.extend(destructure_pattern(
-                    sub_binding,
-                    elem_val,
-                    block,
-                    module,
-                    location,
-                )?);
+                out.extend(destructure_pattern(sub_binding, elem_val, block, module, location)?);
             }
             Ok(out)
         }

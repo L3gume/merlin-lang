@@ -37,8 +37,8 @@ let head = \ls => match ls
 
 # list tail (Option)
 let tail = \ls => match ls
-    | [] => None
-    | x::xs => Some(xs);
+    | [] => []
+    | x::xs => xs;
 
 # last element
 let last = \ls =>
@@ -163,4 +163,16 @@ let append = \ls1 ls2 =>
 let zip = \ls1 ls2 => match (ls1, ls2)
     | (a::as, b::bs) => ((a, b))::(zip as bs)
     | _ => [];
+
+# character utils
+let digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+let lower_letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
+let upper_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'];
+let letters = append lower_letters upper_letters;
+
+let is_digit = \(c: char) => contains c digits;
+let is_letter = \(c: char) => contains c letters;
+let is_lower = \(c: char) => contains c lower_letters;
+let is_upper = \(c: char) => contains c upper_letters;
+let letter_or_digit = \(c: char) => (is_digit c) || (is_letter c);
 

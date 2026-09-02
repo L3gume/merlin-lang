@@ -372,28 +372,56 @@ pub(crate) fn specialize_binding<'c>(
         env.insert(self_name.to_string(), EnvEntry::Abstraction(name.to_string()));
     }
 
-    let pending = if let Some(header) = &header {
-        let mut tail = TailCtx {
-            symbol: symbol.clone(),
-            header,
-            pending: Vec::new(),
+    // Build the function body. On error, the partially-built blocks
+    // cross-reference each other through terminators (`cf.br`/`cf.cond_br`):
+    // dropping them from Rust in the wrong order destroys a terminator after
+    // its successor block was already freed, and destroying a terminator
+    // updates its successors' predecessor lists — a write to freed memory.
+    // A failed compile discards the module anyway, so leak the whole
+    // partially-built graph instead.
+    let pending = {
+        let result = if let Some(header) = &header {
+            let mut tail = TailCtx {
+                symbol: symbol.clone(),
+                header,
+                pending: Vec::new(),
+            };
+            match lower_tail(&inner_body, header, module, &mut env, &mut tail) {
+                Ok(()) => {
+                    let entry_args: Vec<Value<'c, '_>> = (0..all_inputs.len())
+                        .map(|i| {
+                            block
+                                .argument(i)
+                                .map(Into::into)
+                                .map_err(|e: melior::Error| e.to_string())
+                        })
+                        .collect::<Result<_, _>>()?;
+                    block.append_operation(melior::dialect::cf::br(header, &entry_args, location));
+                    let TailCtx { pending, .. } = tail;
+                    Ok(pending)
+                }
+                Err(e) => {
+                    std::mem::forget(tail);
+                    Err(e)
+                }
+            }
+        } else {
+            match lower_expr(&inner_body, &block, module, &mut env) {
+                Ok(body_value) => {
+                    block.append_operation(func::r#return(&[body_value], location));
+                    Ok(Vec::new())
+                }
+                Err(e) => Err(e),
+            }
         };
-        lower_tail(&inner_body, header, module, &mut env, &mut tail)?;
-        let entry_args: Vec<Value<'c, '_>> = (0..all_inputs.len())
-            .map(|i| {
-                block
-                    .argument(i)
-                    .map(Into::into)
-                    .map_err(|e: melior::Error| e.to_string())
-            })
-            .collect::<Result<_, _>>()?;
-        block.append_operation(melior::dialect::cf::br(header, &entry_args, location));
-        let TailCtx { pending, .. } = tail;
-        pending
-    } else {
-        let body_value = lower_expr(&inner_body, &block, module, &mut env)?;
-        block.append_operation(func::r#return(&[body_value], location));
-        Vec::new()
+        match result {
+            Ok(pending) => pending,
+            Err(e) => {
+                std::mem::forget(block);
+                std::mem::forget(header);
+                return Err(e);
+            }
+        }
     };
 
     let function_type = FunctionType::new(module.context, &all_inputs, &[ret_mlir]);

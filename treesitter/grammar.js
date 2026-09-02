@@ -153,6 +153,7 @@ export default grammar({
       'bool',
       'float',
       'str',
+      'char',
       '()',
     ),
 

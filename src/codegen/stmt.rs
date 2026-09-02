@@ -3,11 +3,11 @@
 use crate::ast::*;
 use crate::types::{Monotype, TypeFunc};
 use melior::dialect::llvm::LoadStoreOptions;
-use melior::dialect::{arith, func, llvm};
+use melior::dialect::{arith, func, llvm, scf};
 use melior::ir::{
     Attribute,
-    attribute::{FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
-    operation::OperationBuilder,
+    attribute::{BoolAttribute, FlatSymbolRefAttribute, IntegerAttribute, StringAttribute, TypeAttribute},
+    operation::{OperationBuilder, OperationLike},
     r#type::{FunctionType, IntegerType},
     Block, BlockLike, Identifier, Location, Region, RegionLike, Type, Value, ValueLike,
 };
@@ -15,8 +15,12 @@ use std::collections::HashMap;
 
 use super::{AbstractionInfo, EnumLayout, Module, RecordLayout};
 use super::apply::{default_free_vars, lower_string};
+use super::closures::load_field;
 use super::expr::lower_expr;
-use super::lists::{integer_constant, malloc_call};
+use super::lists::{
+    build_cons, cell_struct_type, empty_list, ensure_malloc, integer_constant, list_is_null,
+    malloc_call,
+};
 use super::types::lower_type;
 
 /// Lower a type-checked program to an MLIR module.
@@ -34,12 +38,13 @@ pub fn lower<'a>(prog: &Program, context: &'a melior::Context) -> Result<Module<
     let entry_block = Block::new(&[]);
     let mut last_value: Option<Value<'a, '_>> = None;
     let mut last_monotype: Option<Monotype> = None;
+    let mut deferred: Option<String> = None;
     for stmt in &prog.stmts {
         match lower_stmt(stmt, &mut module, &entry_block)
-            .map_err(|e| with_stmt_pos(e, &stmt.pos, &prog.source_name))?
+            .map_err(|e| with_stmt_pos(e, &stmt.pos, &prog.source_name))
         {
-            Some(value) => {
-                last_value = Some(value);
+            Ok(value) => {
+                last_value = value;
                 last_monotype = if let SNode::Expr(e) = &*stmt.s {
                     Some(e.typ.clone())
                 } else {
@@ -48,11 +53,29 @@ pub fn lower<'a>(prog: &Program, context: &'a melior::Context) -> Result<Module<
             }
             // A trailing non-expression statement (e.g. a `let`) produces no
             // value: `__main` must return unit, not a stale earlier value.
-            None => {
-                last_value = None;
-                last_monotype = None;
+            Err(e) => {
+                deferred = Some(e);
+                break;
             }
         }
+    }
+    // On failure, log the error and the top-level symbols emitted so far
+    // before discarding the module. The partial module is still built (any
+    // trailing `_entry` function is not), so this shows how far lowering got.
+    if let Some(e) = deferred {
+        eprintln!("codegen: error: {e}");
+        let mut op = module.module.body().first_operation();
+        let mut count = 0;
+        while let Some(o) = op {
+            count += 1;
+            let sym = o
+                .attribute("sym_name")
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "-".to_string());
+            eprintln!("  emitted {count}: {sym}");
+            op = o.next_in_block();
+        }
+        return Err(e);
     }
 
     let location = Location::unknown(context);
@@ -147,6 +170,8 @@ pub(crate) fn register_runtime_builtins<'a>(module: &mut Module<'a>) -> Result<(
     register_builtin(module, emit_itof)?;
     register_builtin(module, emit_ftoi)?;
     register_builtin(module, emit_readin)?;
+    register_builtin(module, emit_tochars)?;
+    register_builtin(module, emit_fromchars)?;
     Ok(())
 }
 
@@ -961,6 +986,344 @@ fn emit_readin<'a>(module: &mut Module<'a>) -> Result<(), String> {
     module.symbols.insert("readin".to_string(), function_type);
     module.functions += 1;
     Ok(())
+}
+
+/// `tochars : str -> list char`, lowered as
+/// `func.func @tochars(!llvm.ptr) -> !llvm.ptr`.
+///
+/// Walks the NUL-terminated string, building a char cons list:
+///
+/// ```text
+/// @tochars(%arg0: !llvm.ptr) -> !llvm.ptr {
+///   %b   = llvm.load %arg0 : !llvm.ptr -> i8
+///   %nul = arith.cmpi eq, %b, 0 : i8
+///   %0   = scf.if %nul -> !llvm.ptr {
+///     %e = llvm.mlir.zero : !llvm.ptr
+///     scf.yield %e : !llvm.ptr
+///   } else {
+///     %c = arith.extui %b : i8 to i32
+///     %q = addi(ptrtoint %arg0, 1)
+///     %s = llvm.inttoptr %q : i64 to !llvm.ptr
+///     %t = func.call @tochars(%s) : (!llvm.ptr) -> !llvm.ptr
+///     %cell = malloc 16; store %c @ cell[0,0]; store %t @ cell[0,1]
+///     scf.yield %cell : !llvm.ptr
+///   }
+///   return %0 : !llvm.ptr
+/// }
+/// ```
+fn emit_tochars<'a>(module: &mut Module<'a>) -> Result<(), String> {
+    let location = Location::unknown(module.context);
+    let t = BuiltinTypes::new(module)?;
+    let i8_type: Type = IntegerType::new(module.context, 8).into();
+
+    let block = Block::new(&[(t.string, location)]);
+    let arg: Value<'_, '_> = block.argument(0).map_err(|e| e.to_string())?.into();
+
+    // Read the first byte of the string.
+    let load_op = llvm::load(module.context, arg, i8_type, location, LoadStoreOptions::new());
+    let byte: Value<'_, '_> = block
+        .append_operation(load_op)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let zero_i8 = integer_constant(module, &block, 8, 0, location)?;
+    let is_nul = arith::cmpi(module.context, arith::CmpiPredicate::Eq, byte, zero_i8, location);
+    let is_nul: Value<'_, '_> = block
+        .append_operation(is_nul)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+
+    // `*s == 0` -> the empty list (null pointer).
+    let then_block = Block::new(&[]);
+    let empty = empty_list(&then_block, module, location)?;
+    then_block.append_operation(scf::r#yield(&[empty], location));
+    let then_region = Region::new();
+    then_region.append_block(then_block);
+
+    // Otherwise cons the char onto the recursive conversion of the rest.
+    let else_block = Block::new(&[]);
+    let extui = OperationBuilder::new("arith.extui", location)
+        .add_operands(&[byte])
+        .add_results(&[t.int])
+        .build()
+        .map_err(|e| e.to_string())?;
+    let char_v: Value<'_, '_> = else_block
+        .append_operation(extui)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let arg_i64 = ptrtoint_i64(module, &else_block, arg, location)?;
+    let one = integer_constant(module, &else_block, 64, 1, location)?;
+    let next_addr = arith::addi(arg_i64, one, location);
+    let next_addr: Value<'_, '_> = else_block
+        .append_operation(next_addr)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let next = inttoptr_ptr(module, &else_block, next_addr, location)?;
+    let call = func::call(
+        module.context,
+        FlatSymbolRefAttribute::new(module.context, "tochars"),
+        &[next],
+        &[t.string],
+        location,
+    );
+    let tail: Value<'_, '_> = else_block
+        .append_operation(call)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let cell = build_cons(char_v, tail, &Monotype::char(), &else_block, module, location)?;
+    else_block.append_operation(scf::r#yield(&[cell], location));
+    let else_region = Region::new();
+    else_region.append_block(else_block);
+
+    let if_op = scf::r#if(is_nul, &[t.string], then_region, else_region, location);
+    let result: Value<'_, '_> = block
+        .append_operation(if_op)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    block.append_operation(func::r#return(&[result], location));
+
+    let function_type = FunctionType::new(module.context, &[t.string], &[t.string]);
+    let region = Region::new();
+    region.append_block(block);
+
+    let function = func::func(
+        module.context,
+        StringAttribute::new(module.context, "tochars"),
+        TypeAttribute::new(function_type.into()),
+        region,
+        &[],
+        location,
+    );
+    module.module.body().append_operation(function);
+    module.symbols.insert("tochars".to_string(), function_type);
+    module.functions += 1;
+    Ok(())
+}
+
+/// `fromchars : list char -> str`, lowered as
+/// `func.func @fromchars(!llvm.ptr) -> !llvm.ptr`.
+///
+/// Counts the list, allocates a `len + 1` byte buffer, fills it with the
+/// truncated chars, and NUL-terminates:
+///
+/// ```text
+/// @fromchars(%arg0: !llvm.ptr) -> !llvm.ptr {
+///   %len = scf.while (lst = %arg0, n = 0) { lst != null } { n + 1, lst.tail }
+///   %buf = func.call @malloc(%len + 1) : (i64) -> i64
+///   scf.while (lst = %arg0, off = 0) { lst != null } {
+///     buf[off] = trunci(lst.head, i8); off + 1, lst.tail
+///   }
+///   buf[%len] = 0
+///   return %buf : !llvm.ptr
+/// }
+/// ```
+fn emit_fromchars<'a>(module: &mut Module<'a>) -> Result<(), String> {
+    let location = Location::unknown(module.context);
+    let t = BuiltinTypes::new(module)?;
+    let i8_type: Type = IntegerType::new(module.context, 8).into();
+    let i32_type: Type = IntegerType::new(module.context, 32).into();
+    let i64_type: Type = IntegerType::new(module.context, 64).into();
+    let cell = cell_struct_type(module, i32_type)?;
+
+    let block = Block::new(&[(t.string, location)]);
+    let arg: Value<'_, '_> = block.argument(0).map_err(|e| e.to_string())?.into();
+    let zero_i64 = integer_constant(module, &block, 64, 0, location)?;
+
+    // Pass 1: count the list length, carrying `(list, n)`.
+    let before = Block::new(&[(t.string, location), (i64_type, location)]);
+    let b_l: Value<'_, '_> = before.argument(0).map_err(|e| e.to_string())?.into();
+    let b_n: Value<'_, '_> = before.argument(1).map_err(|e| e.to_string())?.into();
+    let b_null = list_is_null(b_l, &before, module, location)?;
+    let b_cond = not_i1(module, &before, b_null, location)?;
+    before.append_operation(scf::condition(b_cond, &[b_l, b_n], location));
+    let before_region = Region::new();
+    before_region.append_block(before);
+
+    let after = Block::new(&[(t.string, location), (i64_type, location)]);
+    let a_l: Value<'_, '_> = after.argument(0).map_err(|e| e.to_string())?.into();
+    let a_n: Value<'_, '_> = after.argument(1).map_err(|e| e.to_string())?.into();
+    let a_tail = load_field(module, &after, a_l, cell, 1, t.string, location)?;
+    let one_i64 = integer_constant(module, &after, 64, 1, location)?;
+    let a_n1 = arith::addi(a_n, one_i64, location);
+    let a_n1: Value<'_, '_> = after
+        .append_operation(a_n1)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    after.append_operation(scf::r#yield(&[a_tail, a_n1], location));
+    let after_region = Region::new();
+    after_region.append_block(after);
+
+    let while_op = scf::r#while(
+        &[arg, zero_i64],
+        &[t.string, i64_type],
+        before_region,
+        after_region,
+        location,
+    );
+    let appended = block.append_operation(while_op);
+    let len: Value<'_, '_> = appended
+        .result(1)
+        .map_err(|e| e.to_string())?
+        .into();
+
+    // Pass 2: allocate `len + 1` bytes for the NUL-terminated buffer.
+    ensure_malloc(module)?;
+    let one_i64 = integer_constant(module, &block, 64, 1, location)?;
+    let size = arith::addi(len, one_i64, location);
+    let size: Value<'_, '_> = block
+        .append_operation(size)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let malloc_op = func::call(
+        module.context,
+        FlatSymbolRefAttribute::new(module.context, "malloc"),
+        &[size],
+        &[i64_type],
+        location,
+    );
+    let raw: Value<'_, '_> = block
+        .append_operation(malloc_op)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let buf = inttoptr_ptr(module, &block, raw, location)?;
+    let buf_i64 = ptrtoint_i64(module, &block, buf, location)?;
+
+    // Pass 3: fill the buffer, carrying `(list, offset)`.
+    let before = Block::new(&[(t.string, location), (i64_type, location)]);
+    let b_l: Value<'_, '_> = before.argument(0).map_err(|e| e.to_string())?.into();
+    let b_n: Value<'_, '_> = before.argument(1).map_err(|e| e.to_string())?.into();
+    let b_null = list_is_null(b_l, &before, module, location)?;
+    let b_cond = not_i1(module, &before, b_null, location)?;
+    before.append_operation(scf::condition(b_cond, &[b_l, b_n], location));
+    let before_region = Region::new();
+    before_region.append_block(before);
+
+    let after = Block::new(&[(t.string, location), (i64_type, location)]);
+    let a_l: Value<'_, '_> = after.argument(0).map_err(|e| e.to_string())?.into();
+    let a_n: Value<'_, '_> = after.argument(1).map_err(|e| e.to_string())?.into();
+    let a_head = load_field(module, &after, a_l, cell, 0, i32_type, location)?;
+    let a_tail = load_field(module, &after, a_l, cell, 1, t.string, location)?;
+    let trunci = OperationBuilder::new("arith.trunci", location)
+        .add_operands(&[a_head])
+        .add_results(&[i8_type])
+        .build()
+        .map_err(|e| e.to_string())?;
+    let a_byte: Value<'_, '_> = after
+        .append_operation(trunci)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let out_addr = arith::addi(buf_i64, a_n, location);
+    let out_addr: Value<'_, '_> = after
+        .append_operation(out_addr)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let out_ptr = inttoptr_ptr(module, &after, out_addr, location)?;
+    after.append_operation(llvm::store(
+        module.context,
+        a_byte,
+        out_ptr,
+        location,
+        LoadStoreOptions::new(),
+    ));
+    let one_i64 = integer_constant(module, &after, 64, 1, location)?;
+    let a_n1 = arith::addi(a_n, one_i64, location);
+    let a_n1: Value<'_, '_> = after
+        .append_operation(a_n1)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    after.append_operation(scf::r#yield(&[a_tail, a_n1], location));
+    let after_region = Region::new();
+    after_region.append_block(after);
+
+    let zero_i64 = integer_constant(module, &block, 64, 0, location)?;
+    let while_op = scf::r#while(
+        &[arg, zero_i64],
+        &[t.string, i64_type],
+        before_region,
+        after_region,
+        location,
+    );
+    block.append_operation(while_op);
+
+    // Pass 4: NUL-terminate at `buf + len`.
+    let nul_addr = arith::addi(buf_i64, len, location);
+    let nul_addr: Value<'_, '_> = block
+        .append_operation(nul_addr)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    let nul_ptr = inttoptr_ptr(module, &block, nul_addr, location)?;
+    let zero_i8 = arith::constant(
+        module.context,
+        IntegerAttribute::new(i8_type, 0).into(),
+        location,
+    );
+    let zero_i8: Value<'_, '_> = block
+        .append_operation(zero_i8)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    block.append_operation(llvm::store(
+        module.context,
+        zero_i8,
+        nul_ptr,
+        location,
+        LoadStoreOptions::new(),
+    ));
+
+    block.append_operation(func::r#return(&[buf], location));
+
+    let function_type = FunctionType::new(module.context, &[t.string], &[t.string]);
+    let region = Region::new();
+    region.append_block(block);
+
+    let function = func::func(
+        module.context,
+        StringAttribute::new(module.context, "fromchars"),
+        TypeAttribute::new(function_type.into()),
+        region,
+        &[],
+        location,
+    );
+    module.module.body().append_operation(function);
+    module.symbols.insert("fromchars".to_string(), function_type);
+    module.functions += 1;
+    Ok(())
+}
+
+/// Logical negation of an `i1` value (`arith.xori` with `true`).
+fn not_i1<'c, 'a>(
+    module: &Module<'c>,
+    block: &'a Block<'c>,
+    value: Value<'c, 'a>,
+    location: Location<'c>,
+) -> Result<Value<'c, 'a>, String> {
+    let one = arith::constant(
+        module.context,
+        BoolAttribute::new(module.context, true).into(),
+        location,
+    );
+    let one: Value<'c, 'a> = block
+        .append_operation(one)
+        .result(0)
+        .map_err(|e| e.to_string())?
+        .into();
+    block
+        .append_operation(arith::xori(value, one, location))
+        .result(0)
+        .map_err(|e| e.to_string())
+        .map(Into::into)
 }
 
 /// Emit the external declaration `func.func @name(inputs) -> results` once.

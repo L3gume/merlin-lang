@@ -221,6 +221,10 @@ unsafe fn read_value(ptr: *const u8, mono: &Monotype) -> ExecutionResult {
                     }
                 }
                 TypeFunc::Unit => ExecutionResult::Unit,
+                TypeFunc::Char => {
+                    let c = *(ptr as *const i32);
+                    ExecutionResult::Char(char::from_u32(c as u32).unwrap_or('\u{FFFD}'))
+                }
                 _ => ExecutionResult::Unit,
             },
             Monotype::TypeFuncApplication(ref f, ref args)

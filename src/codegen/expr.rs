@@ -17,11 +17,14 @@ use super::apply::{
     bind_in_env, default_free_vars, lower_abstraction, lower_application, lower_let, lower_literal,
     lower_variable,
 };
+use super::closures::load_field;
 use super::enums::{
     PatternBind, destructure_pattern, enum_disc_eq, enum_variant_fields, load_enum_payload_field,
 };
-use super::equality::{is_aggregate, lower_equality};
-use super::lists::{list_elem, list_is_null, lower_cons, lower_list, integer_constant};
+use super::equality::lower_equality;
+use super::lists::{
+    cell_struct_type, list_elem, list_is_null, lower_cons, lower_list, integer_constant,
+};
 use super::records::{extract_field, field_index, insert_field, record_fields, record_undef};
 use super::stmt::{ensure_extern, ptrtoint_i64, inttoptr_ptr};
 use super::types::lower_type;
@@ -321,22 +324,21 @@ fn lower_comparison<'c, 'a>(
     let lhs = lower_expr(e1, block, module, env)?;
     let rhs = lower_expr(e2, block, module, env)?;
 
-    // `==`/`!=` support structural equality on aggregate types (records,
-    // enums, lists), which the primitive dispatch below cannot classify.
+    // `==`/`!=` lower through [`super::equality::lower_equality`], which
+    // handles scalar types (int/bool/char/unit via `cmpi`, float via `cmpf`,
+    // string via `strcmp`) and structural equality on aggregate types.
     if matches!(op, CompOp::Eq | CompOp::NotEq) {
         let typ = default_free_vars(&e1.typ);
-        if is_aggregate(&typ) {
-            let eq = lower_equality(&typ, lhs, rhs, block, module, location)?;
-            if matches!(op, CompOp::NotEq) {
-                let one = bool_constant(module, block, true, location)?;
-                return block
-                    .append_operation(arith_binop("arith.xori", eq, one, location)?)
-                    .result(0)
-                    .map_err(|e| e.to_string())
-                    .map(Into::into);
-            }
-            return Ok(eq);
+        let eq = lower_equality(&typ, lhs, rhs, block, module, location)?;
+        if matches!(op, CompOp::NotEq) {
+            let one = bool_constant(module, block, true, location)?;
+            return block
+                .append_operation(arith_binop("arith.xori", eq, one, location)?)
+                .result(0)
+                .map_err(|e| e.to_string())
+                .map(Into::into);
         }
+        return Ok(eq);
     }
 
     let operation = match primitive_kind(&e1.typ)? {
@@ -575,18 +577,12 @@ fn lower_match<'c, 'a>(
     let scrut = lower_expr(scrutinee, block, module, env)?;
     let result_type = lower_type(&default_free_vars(result_mono), module)?;
     let scrut_typ = default_free_vars(&scrutinee.typ);
-    // The cons-cell element type, for `x::xs` patterns on a list scrutinee.
-    let elem_mlir = match list_elem(&scrut_typ) {
-        Some(e) => Some(lower_type(&e, module)?),
-        None => None,
-    };
     lower_match_cases(
         scrut,
         &scrut_typ,
         cases,
         0,
         result_type,
-        elem_mlir,
         location,
         block,
         module,
@@ -600,7 +596,6 @@ fn lower_match_cases<'c, 'a: 'b, 'b>(
     cases: &[MatchCase],
     index: usize,
     result_type: Type<'c>,
-    elem_mlir: Option<Type<'c>>,
     location: Location<'c>,
     block: &'b Block<'c>,
     module: &mut Module<'c>,
@@ -626,7 +621,7 @@ fn lower_match_cases<'c, 'a: 'b, 'b>(
         return lower_expr(&case.exp, block, module, &mut case_env);
     }
 
-    let (binding, ctor_index) = case_pattern(case, scrut_typ, elem_mlir, module)?;
+    let binding = case_pattern(case, scrut_typ, module)?;
 
     // The last case is guaranteed to match (exhaustiveness), so lower it
     // directly instead of wrapping it in one more `scf.if`.
@@ -638,7 +633,7 @@ fn lower_match_cases<'c, 'a: 'b, 'b>(
         return lower_expr(&case.exp, block, module, &mut case_env);
     }
 
-    let cond = case_condition(case, ctor_index, scrut, scrut_typ, block, module, location)?;
+    let cond = case_condition(case, scrut, scrut_typ, block, module, location)?;
 
     let mut then_env = env.clone();
     let then_block = Block::new(&[]);
@@ -657,7 +652,6 @@ fn lower_match_cases<'c, 'a: 'b, 'b>(
         cases,
         index + 1,
         result_type,
-        elem_mlir,
         location,
         &else_block,
         module,
@@ -695,128 +689,14 @@ fn constructor_pattern(pat: &Expr) -> Result<(String, Vec<Expr>), String> {
 }
 
 /// The bindings a non-catch-all case pattern produces (loaded in the branch
-/// body) and, for constructor patterns, the discriminant it must equal.
+/// body). Constructor patterns, tuples, records, and lists all recurse through
+/// [`pattern_bind`].
 pub(crate) fn case_pattern<'c>(
     case: &MatchCase,
     scrut_typ: &Monotype,
-    elem_mlir: Option<Type<'c>>,
     module: &mut Module<'c>,
-) -> Result<(Option<PatternBind<'c>>, Option<usize>), String> {
-    match &*case.val.e {
-        ENode::Literal(_) => Ok((None, None)),
-        ENode::List(es) if es.is_empty() => Ok((None, None)),
-        ENode::Cons(hd, tl) => {
-            let (hd_name, tl_name) = match (&*hd.e, &*tl.e) {
-                (ENode::Variable(h), ENode::Variable(t)) => (h.clone(), t.clone()),
-                _ => {
-                    return Err(
-                        "codegen: only `x::xs` cons patterns are supported".to_string()
-                    )
-                }
-            };
-            let elem = elem_mlir
-                .ok_or_else(|| "codegen: cons pattern requires a list scrutinee".to_string())?;
-            Ok((
-                Some(PatternBind::Cons {
-                    head_name: hd_name,
-                    head_type: elem,
-                    tail_name: tl_name,
-                }),
-                None,
-            ))
-        }
-        // `Some x` (or a curried `Pair x y`) binds the constructor's payload
-        // fields that are variables and tests those that are literals.
-        ENode::Application(_, _) => {
-            let (ctor_name, sub_patterns) = constructor_pattern(&case.val)?;
-            let &(ref enum_name, variant_index, arity) = module
-                .constructors
-                .get(&ctor_name)
-                .ok_or_else(|| {
-                    format!("codegen: unsupported match pattern {:?}", *case.val.e)
-                })?;
-            if sub_patterns.len() != arity {
-                return Err(format!(
-                    "codegen: constructor pattern `{ctor_name}` with arity {arity} applied to {} arguments",
-                    sub_patterns.len()
-                ));
-            }
-            let fields = enum_variant_fields(module, scrut_typ, enum_name, variant_index)?;
-            let field_mlirs: Vec<Type<'c>> = fields
-                .iter()
-                .map(|m| lower_type(&default_free_vars(m), module))
-                .collect::<Result<_, _>>()?;
-            let mut binds = Vec::with_capacity(arity);
-            for (i, pat) in sub_patterns.iter().rev().enumerate() {
-                match &*pat.e {
-                    ENode::Variable(n) => binds.push((n.clone(), i)),
-                    ENode::Literal(_) => {}
-                    _ => {
-                        return Err(
-                            "codegen: only variable or literal constructor patterns are supported"
-                                .to_string(),
-                        )
-                    }
-                }
-            }
-            Ok((
-                Some(PatternBind::Enum {
-                    field_types: field_mlirs,
-                    binds,
-                }),
-                Some(variant_index),
-            ))
-        }
-        // A record pattern `Foo { bar: n, baz: 69, .. }` binds variable fields
-        // and tests literal fields; each bound sub-pattern must be a variable.
-        ENode::Record(_, fields) => {
-            let rec_fields = record_fields(&default_free_vars(scrut_typ))?;
-            let mut bindings = Vec::new();
-            for fa in fields {
-                match &*fa.exp.e {
-                    ENode::Variable(name) => {
-                        let index = field_index(&rec_fields, &fa.field)?;
-                        let field_ty = lower_type(&default_free_vars(&rec_fields[index].1), module)?;
-                        bindings.push((name.clone(), field_ty, index));
-                    }
-                    ENode::Literal(_) => {}
-                    _ => {
-                        return Err("codegen: unsupported record pattern field".to_string())
-                    }
-                }
-            }
-            Ok((Some(PatternBind::Record { fields: bindings }), None))
-        }
-        // A nullary constructor pattern `None`.
-        ENode::Variable(name) => {
-            let &(_, variant_index, arity) = module.constructors.get(name).ok_or_else(|| {
-                format!("codegen: unsupported match pattern {:?}", *case.val.e)
-            })?;
-            if arity != 0 {
-                return Err(format!(
-                    "codegen: constructor pattern `{name}` with arity {arity} is not supported"
-                ));
-            }
-            Ok((None, Some(variant_index)))
-        }
-        ENode::Tuple(elems) => {
-            let field_monos = tuple_element_types(scrut_typ)?;
-            let field_mlirs: Vec<Type<'c>> = field_monos
-                .iter()
-                .map(|m| lower_type(&default_free_vars(m), module))
-                .collect::<Result<_, _>>()?;
-            let mut elements = Vec::with_capacity(elems.len());
-            for (e, mono) in elems.iter().zip(field_monos.iter()) {
-                let sub = pattern_bind(e, &default_free_vars(mono), module)?;
-                elements.push((field_mlirs[elements.len()], sub));
-            }
-            Ok((Some(PatternBind::Tuple { elements }), None))
-        }
-        other => Err(format!(
-            "codegen: unsupported match pattern {:?}",
-            *other
-        )),
-    }
+) -> Result<PatternBind<'c>, String> {
+    pattern_bind(&case.val, scrut_typ, module)
 }
 
 /// The element `Monotype`s of a tuple scrutinee type, or an error if it is
@@ -831,30 +711,61 @@ fn tuple_element_types(scrut_typ: &Monotype) -> Result<Vec<Monotype>, String> {
 }
 
 /// Build the [`PatternBind`] that destructures `pat` against a value of type
-/// `ty`, recursing into nested patterns (tuples, cons, records, constructors).
-/// `None` means the pattern binds nothing (a literal or `[]`).
+/// `ty`, recursing into nested patterns (tuples, cons, records, constructors,
+/// list literals). `Nil` means the pattern binds nothing (a literal, `[]`, or
+/// a nullary constructor).
 fn pattern_bind<'c>(
     pat: &Expr,
     ty: &Monotype,
     module: &mut Module<'c>,
-) -> Result<Option<PatternBind<'c>>, String> {
+) -> Result<PatternBind<'c>, String> {
     match &*pat.e {
-        ENode::Variable(name) => Ok(Some(PatternBind::Var { name: name.clone() })),
-        ENode::Literal(_) => Ok(None),
-        ENode::List(es) if es.is_empty() => Ok(None),
-        ENode::Cons(hd, tl) => {
-            let (hd_name, tl_name) = match (&*hd.e, &*tl.e) {
-                (ENode::Variable(h), ENode::Variable(t)) => (h.clone(), t.clone()),
-                _ => return Err("codegen: only `x::xs` cons patterns are supported".to_string()),
+        ENode::Variable(name) => {
+            // A bare constructor name (e.g. `None`) is a nullary constructor
+            // pattern and binds nothing; the discriminant test lives in
+            // `sub_condition`. Any other variable is a binding.
+            if module.constructors.contains_key(name) {
+                Ok(PatternBind::Nil)
+            } else {
+                Ok(PatternBind::Var { name: name.clone() })
+            }
+        }
+        ENode::Literal(_) => Ok(PatternBind::Nil),
+        ENode::List(es) if es.is_empty() => Ok(PatternBind::Nil),
+        // `[a, b, ..]` desugars to nested cons patterns.
+        ENode::List(es) => {
+            let elem = list_elem(ty)
+                .ok_or_else(|| "codegen: list pattern requires a list scrutinee".to_string())?;
+            let elem_ty = default_free_vars(&elem);
+            let elem_mlir = lower_type(&elem_ty, module)?;
+            let list_mlir = lower_type(&default_free_vars(ty), module)?;
+            let head = pattern_bind(&es[0], &elem_ty, module)?;
+            let tail = if es.len() > 1 {
+                pattern_bind(&Expr::from(ENode::List(es[1..].to_vec())), ty, module)?
+            } else {
+                PatternBind::Nil
             };
+            Ok(PatternBind::Cons {
+                head: Box::new(head),
+                head_type: elem_mlir,
+                tail: Box::new(tail),
+                tail_type: list_mlir,
+            })
+        }
+        ENode::Cons(hd, tl) => {
             let elem = list_elem(ty)
                 .ok_or_else(|| "codegen: cons pattern requires a list scrutinee".to_string())?;
-            let head_type = lower_type(&default_free_vars(&elem), module)?;
-            Ok(Some(PatternBind::Cons {
-                head_name: hd_name,
-                head_type,
-                tail_name: tl_name,
-            }))
+            let elem_ty = default_free_vars(&elem);
+            let elem_mlir = lower_type(&elem_ty, module)?;
+            let list_mlir = lower_type(&default_free_vars(ty), module)?;
+            let head = pattern_bind(hd, &elem_ty, module)?;
+            let tail = pattern_bind(tl, &default_free_vars(ty), module)?;
+            Ok(PatternBind::Cons {
+                head: Box::new(head),
+                head_type: elem_mlir,
+                tail: Box::new(tail),
+                tail_type: list_mlir,
+            })
         }
         ENode::Application(_, _) => {
             let (ctor_name, sub_patterns) = constructor_pattern(pat)?;
@@ -875,37 +786,25 @@ fn pattern_bind<'c>(
                 .collect::<Result<_, _>>()?;
             let mut binds = Vec::with_capacity(arity);
             for (i, sub) in sub_patterns.iter().rev().enumerate() {
-                match &*sub.e {
-                    ENode::Variable(n) => binds.push((n.clone(), i)),
-                    ENode::Literal(_) => {}
-                    _ => {
-                        return Err(
-                            "codegen: only variable or literal constructor sub-patterns are supported"
-                                .to_string(),
-                        )
-                    }
-                }
+                let sub_ty = default_free_vars(&fields[i]);
+                binds.push(pattern_bind(sub, &sub_ty, module)?);
             }
-            Ok(Some(PatternBind::Enum {
+            Ok(PatternBind::Enum {
                 field_types: field_mlirs,
                 binds,
-            }))
+            })
         }
         ENode::Record(_, fields) => {
             let rec_fields = record_fields(ty)?;
             let mut bindings = Vec::new();
             for fa in fields {
-                match &*fa.exp.e {
-                    ENode::Variable(name) => {
-                        let index = field_index(&rec_fields, &fa.field)?;
-                        let field_ty = lower_type(&default_free_vars(&rec_fields[index].1), module)?;
-                        bindings.push((name.clone(), field_ty, index));
-                    }
-                    ENode::Literal(_) => {}
-                    _ => return Err("codegen: unsupported record pattern field".to_string()),
-                }
+                let index = field_index(&rec_fields, &fa.field)?;
+                let field_mono = default_free_vars(&rec_fields[index].1);
+                let field_ty = lower_type(&field_mono, module)?;
+                let sub = pattern_bind(&fa.exp, &field_mono, module)?;
+                bindings.push((fa.field.clone(), field_ty, index, sub));
             }
-            Ok(Some(PatternBind::Record { fields: bindings }))
+            Ok(PatternBind::Record { fields: bindings })
         }
         ENode::Tuple(elems) => {
             let field_monos = tuple_element_types(ty)?;
@@ -915,164 +814,37 @@ fn pattern_bind<'c>(
                 .collect::<Result<_, _>>()?;
             let mut elements = Vec::with_capacity(elems.len());
             for (e, mono) in elems.iter().zip(field_monos.iter()) {
-                let sub = pattern_bind(e, &default_free_vars(mono), module)?;
+                let sub_ty = default_free_vars(mono);
+                let sub = pattern_bind(e, &sub_ty, module)?;
                 elements.push((field_mlirs[elements.len()], sub));
             }
-            Ok(Some(PatternBind::Tuple { elements }))
+            Ok(PatternBind::Tuple { elements })
         }
         _ => Err(format!("codegen: unsupported match pattern {:?}", *pat.e)),
     }
 }
 
-/// The `i1` condition under which a non-catch-all case matches: a literal
-/// compares for equality, `[]` tests for an empty list, `x::xs` tests for a
-/// non-empty list, constructor patterns compare the discriminant, and a record
-/// pattern tests each literal field for equality.
+/// The `i1` condition under which a non-catch-all case matches. Delegates to
+/// [`sub_condition`], which recurses through every pattern kind.
 pub(crate) fn case_condition<'c, 'a>(
     case: &MatchCase,
-    ctor_index: Option<usize>,
     scrut: Value<'c, 'a>,
     scrut_typ: &Monotype,
     block: &'a Block<'c>,
     module: &mut Module<'c>,
     location: Location<'c>,
 ) -> Result<Value<'c, 'a>, String> {
-    match &*case.val.e {
-        // `lit => e` matches when `scrut == lit`.
-        ENode::Literal(lit) => {
-            let pattern = lower_literal(lit, block, module, location)?;
-            let cmp = arith::cmpi(
-                module.context,
-                arith::CmpiPredicate::Eq,
-                scrut,
-                pattern,
-                location,
-            );
-            block
-                .append_operation(cmp)
-                .result(0)
-                .map_err(|e| e.to_string())
-                .map(Into::into)
-        }
-        // `[] => e` matches when the list is empty (null).
-        ENode::List(_) => list_is_null(scrut, block, module, location),
-        // `x::xs => e` matches when the list is non-empty.
-        ENode::Cons(..) => {
-            let is_null = list_is_null(scrut, block, module, location)?;
-            let one = bool_constant(module, block, true, location)?;
-            let not_null_op = arith_binop("arith.xori", is_null, one, location)?;
-            block
-                .append_operation(not_null_op)
-                .result(0)
-                .map_err(|e| e.to_string())
-                .map(Into::into)
-        }
-        // A record pattern matches when each literal field equals its value;
-        // variable fields bind and impose no condition.
-        ENode::Record(_, fields) => {
-            let rec_fields = record_fields(&default_free_vars(scrut_typ))?;
-            let mut cond = bool_constant(module, block, true, location)?;
-            for fa in fields {
-                if let ENode::Literal(lit) = &*fa.exp.e {
-                    let index = field_index(&rec_fields, &fa.field)?;
-                    let field_ty = lower_type(&default_free_vars(&rec_fields[index].1), module)?;
-                    let field_val =
-                        extract_field(module, block, scrut, index as i32, field_ty, location)?;
-                    let lit_val = lower_literal(lit, block, module, location)?;
-                    let cmp = arith::cmpi(
-                        module.context,
-                        arith::CmpiPredicate::Eq,
-                        field_val,
-                        lit_val,
-                        location,
-                    );
-                    let cmp_val: Value<'c, 'a> = block
-                        .append_operation(cmp)
-                        .result(0)
-                        .map_err(|e| e.to_string())?
-                        .into();
-                    let and = arith_binop("arith.andi", cond, cmp_val, location)?;
-                    cond = block
-                        .append_operation(and)
-                        .result(0)
-                        .map_err(|e| e.to_string())?
-                        .into();
-                }
-            }
-            Ok(cond)
-        }
-        ENode::Tuple(elems) => {
-            let field_monos = tuple_element_types(scrut_typ)?;
-            let mut cond = bool_constant(module, block, true, location)?;
-            for (i, e) in elems.iter().enumerate() {
-                let elem_ty = default_free_vars(&field_monos[i]);
-                let elem_mlir = lower_type(&elem_ty, module)?;
-                let elem_val = extract_field(module, block, scrut, i as i32, elem_mlir, location)?;
-                let sub = sub_condition(e, &elem_ty, elem_val, block, module, location)?;
-                let and = arith_binop("arith.andi", cond, sub, location)?;
-                cond = block
-                    .append_operation(and)
-                    .result(0)
-                    .map_err(|e| e.to_string())?
-                    .into();
-            }
-            Ok(cond)
-        }
-        // `Some x` / `Some 5` / `Pair a b` / `None`: match on the discriminant
-        // and, for payload constructors, on any literal field sub-patterns.
-        _ => {
-            let index = ctor_index.ok_or_else(|| {
-                "codegen: internal error: missing constructor index".to_string()
-            })?;
-            let mut cond = enum_disc_eq(module, block, scrut, index, location)?;
-            if let ENode::Application(_, _) = &*case.val.e {
-                let (ctor_name, sub_patterns) = constructor_pattern(&case.val)?;
-                let &(ref enum_name, variant_index, _) = module
-                    .constructors
-                    .get(&ctor_name)
-                    .ok_or_else(|| {
-                        format!("codegen: unsupported match pattern {:?}", *case.val.e)
-                    })?;
-                let fields = enum_variant_fields(module, scrut_typ, enum_name, variant_index)?;
-                let field_mlirs: Vec<Type<'c>> = fields
-                    .iter()
-                    .map(|m| lower_type(&default_free_vars(m), module))
-                    .collect::<Result<_, _>>()?;
-                for (i, pat) in sub_patterns.iter().rev().enumerate() {
-                    if let ENode::Literal(lit) = &*pat.e {
-                        let field_val = load_enum_payload_field(
-                            module, block, scrut, &field_mlirs, i as i32, location,
-                        )?;
-                        let lit_val = lower_literal(lit, block, module, location)?;
-                        let cmp = arith::cmpi(
-                            module.context,
-                            arith::CmpiPredicate::Eq,
-                            field_val,
-                            lit_val,
-                            location,
-                        );
-                        let cmp_val: Value<'c, 'a> = block
-                            .append_operation(cmp)
-                            .result(0)
-                            .map_err(|e| e.to_string())?
-                            .into();
-                        let and = arith_binop("arith.andi", cond, cmp_val, location)?;
-                        cond = block
-                            .append_operation(and)
-                            .result(0)
-                            .map_err(|e| e.to_string())?
-                            .into();
-                    }
-                }
-            }
-            Ok(cond)
-        }
-    }
+    sub_condition(&case.val, scrut_typ, scrut, block, module, location)
 }
 
 /// The `i1` condition under which the sub-pattern `pat` (of type `ty`) matches
-/// a value `val` of that type. Recurses so nested patterns inside a tuple are
-/// handled. A variable/`[]`/nested-variable-only pattern always matches.
+/// a value `val` of that type. Recurses so nested tuples, records, lists, and
+/// constructor patterns are handled. A bare variable always matches; a bare
+/// constructor name (e.g. `None`) matches on the discriminant.
+///
+/// List and constructor sub-patterns guard their pointer loads behind an
+/// `scf.if`: an eager `arith.andi` would otherwise dereference a null list or
+/// a nullary variant's null `data` pointer when the guard fails.
 fn sub_condition<'c, 'a>(
     pat: &Expr,
     ty: &Monotype,
@@ -1081,24 +853,83 @@ fn sub_condition<'c, 'a>(
     module: &mut Module<'c>,
     location: Location<'c>,
 ) -> Result<Value<'c, 'a>, String> {
+    let bool_type: Type<'c> = IntegerType::new(module.context, 1).into();
     match &*pat.e {
         ENode::Literal(lit) => {
             let pattern = lower_literal(lit, block, module, location)?;
-            let cmp = arith::cmpi(module.context, arith::CmpiPredicate::Eq, val, pattern, location);
-            block
-                .append_operation(cmp)
-                .result(0)
-                .map_err(|e| e.to_string())
-                .map(Into::into)
+            lower_equality(
+                &default_free_vars(ty),
+                val,
+                pattern,
+                block,
+                module,
+                location,
+            )
         }
-        ENode::Variable(_) => bool_constant(module, block, true, location),
-        ENode::List(_) => list_is_null(val, block, module, location),
-        ENode::Cons(..) => {
+        // A nullary constructor pattern `None` tests the discriminant; a plain
+        // variable always matches.
+        ENode::Variable(name) => {
+            if let Some(&(_, variant_index, _)) = module.constructors.get(name) {
+                enum_disc_eq(module, block, val, variant_index, location)
+            } else {
+                bool_constant(module, block, true, location)
+            }
+        }
+        // `[]` matches when the list is empty (null).
+        ENode::List(es) if es.is_empty() => list_is_null(val, block, module, location),
+        // `[a, b, ..]` desugars to nested cons conditions.
+        ENode::List(es) => {
+            let head = es[0].clone();
+            let tail = if es.len() > 1 {
+                Expr::from(ENode::List(es[1..].to_vec()))
+            } else {
+                Expr::from(ENode::List(vec![]))
+            };
+            let cons = Expr::from(ENode::Cons(Box::new(head), Box::new(tail)));
+            sub_condition(&cons, ty, val, block, module, location)
+        }
+        ENode::Cons(hd, tl) => {
+            let elem = list_elem(ty)
+                .ok_or_else(|| "codegen: cons pattern requires a list scrutinee".to_string())?;
+            let elem_ty = default_free_vars(&elem);
+            let elem_mlir = lower_type(&elem_ty, module)?;
+            let ptr: Type = Type::parse(module.context, "!llvm.ptr")
+                .ok_or_else(|| "codegen: failed to create `!llvm.ptr`".to_string())?;
+            let cell = cell_struct_type(module, elem_mlir)?;
+            let list_ty = default_free_vars(ty);
+
             let is_null = list_is_null(val, block, module, location)?;
             let one = bool_constant(module, block, true, location)?;
-            let not_null_op = arith_binop("arith.xori", is_null, one, location)?;
+            let nonnull = block
+                .append_operation(arith_binop("arith.xori", is_null, one, location)?)
+                .result(0)
+                .map_err(|e| e.to_string())?
+                .into();
+
+            let then_block = Block::new(&[]);
+            let head_val = load_field(module, &then_block, val, cell, 0, elem_mlir, location)?;
+            let tail_val = load_field(module, &then_block, val, cell, 1, ptr, location)?;
+            let mut cond = sub_condition(hd, &elem_ty, head_val, &then_block, module, location)?;
+            let sub = sub_condition(tl, &list_ty, tail_val, &then_block, module, location)?;
+            cond = and_i1(&then_block, cond, sub, location)?;
+            then_block.append_operation(scf::r#yield(&[cond], location));
+            let then_region = Region::new();
+            then_region.append_block(then_block);
+
+            let else_block = Block::new(&[]);
+            let f = bool_constant(module, &else_block, false, location)?;
+            else_block.append_operation(scf::r#yield(&[f], location));
+            let else_region = Region::new();
+            else_region.append_block(else_block);
+
             block
-                .append_operation(not_null_op)
+                .append_operation(scf::r#if(
+                    nonnull,
+                    &[bool_type],
+                    then_region,
+                    else_region,
+                    location,
+                ))
                 .result(0)
                 .map_err(|e| e.to_string())
                 .map(Into::into)
@@ -1111,12 +942,7 @@ fn sub_condition<'c, 'a>(
                 let elem_mlir = lower_type(&elem_ty, module)?;
                 let elem_val = extract_field(module, block, val, i as i32, elem_mlir, location)?;
                 let sub = sub_condition(e, &elem_ty, elem_val, block, module, location)?;
-                let and = arith_binop("arith.andi", cond, sub, location)?;
-                cond = block
-                    .append_operation(and)
-                    .result(0)
-                    .map_err(|e| e.to_string())?
-                    .into();
+                cond = and_i1(block, cond, sub, location)?;
             }
             Ok(cond)
         }
@@ -1124,31 +950,12 @@ fn sub_condition<'c, 'a>(
             let rec_fields = record_fields(ty)?;
             let mut cond = bool_constant(module, block, true, location)?;
             for fa in fields {
-                if let ENode::Literal(lit) = &*fa.exp.e {
-                    let index = field_index(&rec_fields, &fa.field)?;
-                    let field_ty = lower_type(&default_free_vars(&rec_fields[index].1), module)?;
-                    let field_val =
-                        extract_field(module, block, val, index as i32, field_ty, location)?;
-                    let lit_val = lower_literal(lit, block, module, location)?;
-                    let cmp = arith::cmpi(
-                        module.context,
-                        arith::CmpiPredicate::Eq,
-                        field_val,
-                        lit_val,
-                        location,
-                    );
-                    let cmp_val: Value<'c, 'a> = block
-                        .append_operation(cmp)
-                        .result(0)
-                        .map_err(|e| e.to_string())?
-                        .into();
-                    let and = arith_binop("arith.andi", cond, cmp_val, location)?;
-                    cond = block
-                        .append_operation(and)
-                        .result(0)
-                        .map_err(|e| e.to_string())?
-                        .into();
-                }
+                let index = field_index(&rec_fields, &fa.field)?;
+                let field_mono = default_free_vars(&rec_fields[index].1);
+                let field_ty = lower_type(&field_mono, module)?;
+                let field_val = extract_field(module, block, val, index as i32, field_ty, location)?;
+                let sub = sub_condition(&fa.exp, &field_mono, field_val, block, module, location)?;
+                cond = and_i1(block, cond, sub, location)?;
             }
             Ok(cond)
         }
@@ -1162,35 +969,55 @@ fn sub_condition<'c, 'a>(
                 .iter()
                 .map(|m| lower_type(&default_free_vars(m), module))
                 .collect::<Result<_, _>>()?;
-            let mut cond = enum_disc_eq(module, block, val, variant_index, location)?;
+
+            let disc_ok = enum_disc_eq(module, block, val, variant_index, location)?;
+
+            let then_block = Block::new(&[]);
+            let mut cond = bool_constant(module, &then_block, true, location)?;
             for (i, sub) in sub_patterns.iter().rev().enumerate() {
-                if let ENode::Literal(lit) = &*sub.e {
-                    let field_val = load_enum_payload_field(
-                        module, block, val, &field_mlirs, i as i32, location,
-                    )?;
-                    let lit_val = lower_literal(lit, block, module, location)?;
-                    let cmp = arith::cmpi(
-                        module.context,
-                        arith::CmpiPredicate::Eq,
-                        field_val,
-                        lit_val,
-                        location,
-                    );
-                    let cmp_val: Value<'c, 'a> = block
-                        .append_operation(cmp)
-                        .result(0)
-                        .map_err(|e| e.to_string())?
-                        .into();
-                    let and = arith_binop("arith.andi", cond, cmp_val, location)?;
-                    cond = block
-                        .append_operation(and)
-                        .result(0)
-                        .map_err(|e| e.to_string())?
-                        .into();
-                }
+                let field_mono = default_free_vars(&fields[i]);
+                let field_val = load_enum_payload_field(
+                    module, &then_block, val, &field_mlirs, i as i32, location,
+                )?;
+                let sub_cond = sub_condition(sub, &field_mono, field_val, &then_block, module, location)?;
+                cond = and_i1(&then_block, cond, sub_cond, location)?;
             }
-            Ok(cond)
+            then_block.append_operation(scf::r#yield(&[cond], location));
+            let then_region = Region::new();
+            then_region.append_block(then_block);
+
+            let else_block = Block::new(&[]);
+            let f = bool_constant(module, &else_block, false, location)?;
+            else_block.append_operation(scf::r#yield(&[f], location));
+            let else_region = Region::new();
+            else_region.append_block(else_block);
+
+            block
+                .append_operation(scf::r#if(
+                    disc_ok,
+                    &[bool_type],
+                    then_region,
+                    else_region,
+                    location,
+                ))
+                .result(0)
+                .map_err(|e| e.to_string())
+                .map(Into::into)
         }
         _ => Ok(bool_constant(module, block, true, location)?),
     }
+}
+
+/// Logical AND of two `i1` values (`arith.andi`).
+fn and_i1<'c, 'a>(
+    block: &'a Block<'c>,
+    lhs: Value<'c, 'a>,
+    rhs: Value<'c, 'a>,
+    location: Location<'c>,
+) -> Result<Value<'c, 'a>, String> {
+    block
+        .append_operation(arith_binop("arith.andi", lhs, rhs, location)?)
+        .result(0)
+        .map_err(|e| e.to_string())
+        .map(Into::into)
 }

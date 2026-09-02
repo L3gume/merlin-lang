@@ -662,3 +662,145 @@ fn n_ary_enum_pattern_all_literals() {
         42
     );
 }
+
+#[test]
+fn match_string_literal_pattern() {
+    assert_eq!(
+        expect_int(
+            "let f = \\s => match s | \"\" => 0 | \"hi\" => 1 | x => 2;
+             (f \"\") + (f \"hi\") + (f \"bye\");"
+        ),
+        3
+    );
+}
+
+#[test]
+fn match_string_literal_via_equality() {
+    assert_eq!(
+        expect_int(
+            "let same = \\(s : str) => (s == \"hello\");
+             if (same \"hello\") then 1 else 0;"
+        ),
+        1
+    );
+}
+
+#[test]
+fn tochars_fromchars_roundtrip() {
+    assert!(expect_bool("(fromchars (tochars \"hello\")) == \"hello\";"));
+}
+
+#[test]
+fn fromchars_builds_string_from_char_list() {
+    assert!(expect_bool("(fromchars ['h', 'i']) == \"hi\";"));
+}
+
+#[test]
+fn tochars_roundtrips_empty_string() {
+    assert!(expect_bool("(fromchars (tochars \"\")) == \"\";"));
+}
+
+#[test]
+fn fromchars_empty_list_yields_empty_string() {
+    assert!(expect_bool("(fromchars []) == \"\";"));
+}
+
+#[test]
+fn tochars_char_list_head() {
+    // `tochars` maps each byte to its char; the head of `tochars "hi"` is 'h'.
+    let out = expect_list("tochars \"hi\";");
+    match out.as_slice() {
+        [codegen::ExecutionResult::Char(h), codegen::ExecutionResult::Char(i)] => {
+            assert_eq!(*h, 'h');
+            assert_eq!(*i, 'i');
+        }
+        other => panic!("expected two chars, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_constructor_pattern_tail_recursive() {
+    // Regression: a nested constructor pattern `Ok((o, r))` (a tuple payload
+    // inside an enum constructor) used to fail codegen inside a tail-recursive
+    // lambda's call chain, and the partially-built `cf.br`/`cf.cond_br` blocks
+    // could corrupt the heap at module teardown. Nested patterns now lower
+    // correctly, including in a tail-recursive loop.
+    assert_eq!(
+        expect_int_prelude(
+            "enum Op = Plus | Val(int);
+             let eval = \\(o : Op) => match o
+                 | Plus => 1
+                 | Val(n) => n;
+             let sum = \\(acc : int) xs => match xs
+                 | [] => acc
+                 | x::rest => (match x
+                     | Ok((o, r)) => sum (acc + eval o) rest
+                     | Err(msg) => acc);
+             sum 0 [Ok((Val(3), [1, 2])), Ok((Plus, [7]))];"
+        ),
+        4
+    );
+}
+
+#[test]
+fn nested_list_literal_pattern() {
+    // A non-empty list literal pattern `[a, b]` destructures like `a :: b :: []`
+    // and also matches on its sub-patterns.
+    assert_eq!(
+        expect_int(
+            "let f = \\xs => match xs
+             | [1, 2] => 12
+             | [x, y] => x * 10 + y
+             | [] => 0
+             | _ => -1;
+             (f [1, 2]) + (f [3, 4]) + (f []) + (f [5, 6, 7]);"
+        ),
+        12 + 34 + 0 - 1
+    );
+}
+
+#[test]
+fn nested_record_pattern_in_tuple() {
+    // A record pattern nested inside a tuple sub-pattern binds its fields and
+    // tests its literal fields.
+    assert_eq!(
+        expect_int(
+            "record Point = { x: int, y: int };
+             let f = \\t => match t
+                 | (Point { x: a, y: 2 }, Point { x: b, y: c }) => a + b + c
+                 | _ => 0;
+             f ((Point { x: 1, y: 2 }, Point { x: 3, y: 4 }));"
+        ),
+        1 + 3 + 4
+    );
+}
+
+#[test]
+fn nested_constructor_in_constructor_pattern() {
+    // A constructor pattern nested inside another constructor's payload, and a
+    // nullary constructor (`None`) as a tuple sub-pattern.
+    assert_eq!(
+        expect_int_prelude(
+            "let f = \\xs => match xs
+             | [(Some(Some(n)), None)] => n
+             | _ => 0;
+             f [(Some(Some(42)), None)];"
+        ),
+        42
+    );
+}
+
+#[test]
+fn nested_tuple_pattern_with_string_literals() {
+    // Tuple sub-patterns with string literals compare via `strcmp`.
+    assert_eq!(
+        expect_int(
+            "let f = \\t => match t
+             | (\"a\", \"b\") => 1
+             | (\"a\", y) => 2
+             | _ => 3;
+             (f ((\"a\", \"b\"))) + (f ((\"a\", \"z\"))) + (f ((\"q\", \"b\")));"
+        ),
+        1 + 2 + 3
+    );
+}

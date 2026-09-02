@@ -12,5 +12,76 @@ let eval = \operation => match operation
     | Div(op1, op2) => (eval op1) / (eval op2)
     | Val(v) => v;
 
-println (ftostr (eval Plus(Times(Val(2.0), Val(2.0)), Val(4.0))));
+let parse_number = \(cs : list char) =>
+    let aux = (\(acc : list char) cs => match cs
+        | [] => (
+            if len acc > 0 then
+                Ok((Val(strtof (fromchars acc)), []))
+            else
+                Err("no digits")
+        )
+        | c::cs => (
+            if (is_digit c) || c == '.' then
+                aux (append acc [c]) cs
+            else if len acc > 0 then
+                Ok((Val(strtof (fromchars acc)), c::cs))
+            else
+                Err("no digits")
+        )
+    ) in
+    aux [] cs;
+
+let parse_term = \(cs : list char) =>
+    match parse_number cs
+    | Ok((num, rest)) => (
+        match (head rest)
+        | Some('*') => (
+            match parse_number (tail rest)
+            | Ok((term, rst)) => Ok((Times(num, term), rst))
+            | Err(msg) => Err(msg)
+        )
+        | Some('/') => (
+            match parse_number (tail rest)
+            | Ok((term, rst)) => Ok((Div(num, term), rst))
+            | Err(msg) => Err(msg)
+        ) 
+        | Some(_) => Ok((num, rest))
+        | None => Ok((num, []))
+    )
+    | Err(msg) => Err(msg);
+
+let parse_expr = \(cs : list char) =>
+    match parse_term cs
+    | Ok((term, rest)) => (
+        match head rest
+        | Some('+') => (
+            match parse_expr (tail rest)
+            | Ok((expr, rst)) => Ok((Plus(term, expr), rst))
+            | Err(msg) => Err(msg)
+        )
+        | Some('-') => (
+            match parse_expr (tail rest)
+            | Ok((expr, rst)) => Ok((Minus(term, expr), rst))
+            | Err(msg) => Err(msg)
+        )
+        | Some(_) => Ok((term, rest))
+        | None => Ok((term, []))
+    )
+    | Err(msg) => Err(msg);
+
+let parse = \(s : str) => match parse_expr (tochars s)
+    | Ok((expr, _)) => expr
+    | Err(msg) => {
+            println msg;
+            Val(0.0)
+        };
+
+let loop = \inputfn => match inputfn ()
+    | "" => ()
+    | s => {
+        println (ftostr (eval (parse s)));
+        loop inputfn
+    };
+
+loop readin;
 

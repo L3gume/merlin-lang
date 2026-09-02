@@ -21,7 +21,7 @@
 use crate::ast::*;
 use crate::types::Monotype;
 use melior::dialect::{cf, func};
-use melior::ir::{Block, BlockLike, Location, Type, Value};
+use melior::ir::{Block, BlockLike, Location, Value};
 
 use super::{Env, EnvEntry, Module};
 use super::apply::{
@@ -30,8 +30,6 @@ use super::apply::{
 };
 use super::enums::destructure_pattern;
 use super::expr::{case_condition, case_pattern, lower_block_stmt, lower_expr};
-use super::lists::list_elem;
-use super::types::lower_type;
 
 /// Loop-header state for lowering one tail-recursive specialization body.
 pub(crate) struct TailCtx<'b, 'c> {
@@ -104,13 +102,7 @@ pub(crate) fn lower_tail<'c, 'a>(
         ENode::Match(scrutinee, cases) => {
             let scrut = lower_expr(scrutinee, block, module, env)?;
             let scrut_typ = default_free_vars(&scrutinee.typ);
-            let elem_mlir = match list_elem(&scrut_typ) {
-                Some(e) => Some(lower_type(&e, module)?),
-                None => None,
-            };
-            lower_tail_match_cases(
-                scrut, &scrut_typ, cases, 0, elem_mlir, location, block, module, env, tail,
-            )
+            lower_tail_match_cases(scrut, &scrut_typ, cases, 0, location, block, module, env, tail)
         }
         ENode::Application(f, x) => {
             if !try_self_tail_call(f, x, block, module, env, tail, location)? {
@@ -212,7 +204,6 @@ fn lower_tail_match_cases<'c, 'a: 'b, 'b>(
     scrut_typ: &Monotype,
     cases: &[MatchCase],
     index: usize,
-    elem_mlir: Option<Type<'c>>,
     location: Location<'c>,
     block: &'b Block<'c>,
     module: &mut Module<'c>,
@@ -239,7 +230,7 @@ fn lower_tail_match_cases<'c, 'a: 'b, 'b>(
             return lower_tail(&case.exp, block, module, &mut case_env, tail);
     }
 
-    let (binding, ctor_index) = case_pattern(case, scrut_typ, elem_mlir, module)?;
+    let binding = case_pattern(case, scrut_typ, module)?;
 
     // The last case is guaranteed to match (exhaustiveness), so lower it
     // directly instead of emitting one more branch.
@@ -251,7 +242,7 @@ fn lower_tail_match_cases<'c, 'a: 'b, 'b>(
         return lower_tail(&case.exp, block, module, &mut case_env, tail);
     }
 
-    let cond = case_condition(case, ctor_index, scrut, scrut_typ, block, module, location)?;
+    let cond = case_condition(case, scrut, scrut_typ, block, module, location)?;
     let then_block = Block::new(&[]);
     let else_block = Block::new(&[]);
     block.append_operation(cf::cond_br(
@@ -275,7 +266,6 @@ fn lower_tail_match_cases<'c, 'a: 'b, 'b>(
         scrut_typ,
         cases,
         index + 1,
-        elem_mlir,
         location,
         &else_block,
         module,
