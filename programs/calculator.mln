@@ -23,6 +23,8 @@ let parse_number = \(cs : list char) =>
         | c::cs => (
             if (is_digit c) || c == '.' then
                 aux (append acc [c]) cs
+            else if c == ' ' then
+                aux acc cs
             else if len acc > 0 then
                 Ok((Val(strtof (fromchars acc)), c::cs))
             else
