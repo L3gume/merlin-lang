@@ -1,0 +1,50 @@
+record Logged('a) = {
+    result : 'a,
+    logs : list str
+};
+
+let create_logged : int => Logged(int) =
+    \x => Logged { result : x, logs : [] };
+
+let run_with_logs : (int => Logged(int)) => Logged(int) => Logged(int) =
+    \(fn : int => Logged(int)) (logged : Logged(int)) => 
+        let new_result = fn logged.result in
+            new_result with { logs : (append logged.logs new_result.logs) };
+
+let square : int => Logged(int) =
+    \(n : int) => 
+        Logged { 
+            result : n * n,
+            logs : ["Squared " + (itostr n) + ", result = " + (itostr (n*n))]
+        };
+
+let add_n : int => int => Logged(int) =
+    \(to_add : int) => \(n : int) => 
+        Logged { 
+            result : n + to_add,
+            logs : ["Added " + (itostr to_add) + " to " + (itostr n) + ", result = " + (itostr (n+to_add))]
+        };
+
+let mult_by : int => int => Logged(int) =
+    \(to_mult : int) => \(n : int) => 
+        Logged { 
+            result : n * to_mult,
+            logs : ["Multiplied " + (itostr n) + " by " + (itostr to_mult) + ", result = " + (itostr (n*to_mult))]
+        };
+
+let dump_logs : Logged(int) => () =
+    \(logged : Logged(int)) => iter println (logged.logs);
+
+# TODO: these partial applications cause an issue:
+# thread 'main' (3642737) panicked at src/codegen/apply.rs:649:53:
+# range start index 2 out of range for slice of length 1
+let logged_add = \n => run_with_logs (add_n n);
+let logged_square = run_with_logs square;
+let logged_mult = \n => run_with_logs (mult_by n);
+
+let a = create_logged 5;
+let b = (logged_add 1) a;
+let c = logged_square b;
+let d = (logged_mult 3) c;
+
+dump_logs d;
