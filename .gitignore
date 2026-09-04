@@ -1,5 +1,5 @@
 /target
 # Compiled binaries in programs/
 /programs/**/*
-!/programs/**/*.*
+!/programs/**/?*.*
 !/programs/**/
