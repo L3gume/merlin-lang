@@ -1,5 +1,7 @@
 /target
-# Compiled binaries in programs/
-programs/*
-!programs/?*.*
-!programs/**/
+
+# Ignore all
+*
+
+# Unignore all files with extensions recursively
+!**/*.*
