@@ -30,13 +30,13 @@
     - [x] last
     - [x] indexing (?) -- added some sort of indexing
     - [x] append
-- [ ] new types
+- [x] new types
     - [x] escape sequences in strings
     - [x] char
     - [x] User-defined structure types
-    - [ ] n-tuple type
-- [ ] Pattern matching syntax
-    - [ ] change enum type pattern to `Name(arg1, ..., arg2)` instead of generic application
+    - [x] n-tuple type
+- [x] Pattern matching syntax
+    - [x] change enum type pattern to `Name(arg1, ..., arg2)` instead of generic application
 - [x] get rid of REPL, more trouble than worth (or make it useable?)
     * simply ignore it for now I guess
 - [ ] optimizations
@@ -44,14 +44,13 @@
     - [x] logic expr short-circuiting
 - [ ] lifetime analysis for memory mgmt with refs like in Rust
 - [ ] str-related builtins
-    - [ ] support cons expression? (char::\[char\])
     - [ ] format (str -> fn (depends on number of format specifiers in input str)) (probably prelude)
-    - [ ] to_chars (str -> list char) builtin
-    - [ ] from_chars (list char -> str) builtin
+    - [x] to_chars (str -> list char) builtin
+    - [x] from_chars (list char -> str) builtin
     - [ ] get_at (int -> str -> option char) (prelude)
-    - [ ] len (str -> int) (prelude)
+    - [x] len (str -> int) (prelude)
     - [ ] substr
     - [ ] trim, rtrim, ltrim
     - [ ] whatever else, leverage libc I guess
 - [ ] unicode character support
-- [ ] n-ary enum constructor support (only 1 for now..)
+- [x] n-ary enum constructor support (only 1 for now..)

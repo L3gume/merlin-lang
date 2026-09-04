@@ -1,0 +1,7 @@
+let untrimmed = "   \tnot trimmed\r\n   ";
+
+println untrimmed;
+println (ltrim untrimmed);
+println (rtrim untrimmed);
+println (trim untrimmed);
+

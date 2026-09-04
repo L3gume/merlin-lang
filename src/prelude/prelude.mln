@@ -152,6 +152,15 @@ let tfilter = \pred ls =>
     in
     aux [] ls;
 
+let remove_while = \pred ls => match ls
+    | [] => []
+    | x::xs => (
+        if pred x then
+            remove_while pred xs
+        else
+            ls
+    );
+
 # append (tail recursive)
 let append = \ls1 ls2 =>
     let aux = (\acc l => match l
@@ -168,6 +177,7 @@ let zip = \ls1 ls2 => match (ls1, ls2)
 let digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 let lower_letters = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z'];
 let upper_letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z'];
+let whitespace = [' ', '\r', '\n', '\t'];
 let letters = append lower_letters upper_letters;
 
 let is_digit = \(c: char) => contains c digits;
@@ -175,4 +185,16 @@ let is_letter = \(c: char) => contains c letters;
 let is_lower = \(c: char) => contains c lower_letters;
 let is_upper = \(c: char) => contains c upper_letters;
 let letter_or_digit = \(c: char) => (is_digit c) || (is_letter c);
+let is_whitespace = \(c: char) => contains c whitespace;
+
+# string utils
+let strlen = \(s : str) => len (tochars s);
+let getchar = \idx s => get_i idx (tochars s);
+
+let ltrim = \(s : str) => fromchars (remove_while is_whitespace (tochars s));
+let rtrim = \(s : str) => fromchars (rev (remove_while is_whitespace (rev (tochars s))));
+let trim = \(s : str) =>
+    let chars = tochars s in
+    let rtrimmed = remove_while is_whitespace (rev chars) in
+    fromchars (remove_while is_whitespace (rev rtrimmed));
 
